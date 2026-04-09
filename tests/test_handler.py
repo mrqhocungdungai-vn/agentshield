@@ -329,10 +329,19 @@ class TestHandleIntegration:
         assert result["allow"] is True
 
     @pytest.mark.asyncio
-    async def test_unlisted_allowed_when_deny_unlisted_false(self, mock_config):
+    async def test_unlisted_auto_guest_chat_allowed(self, mock_config):
+        """Unlisted user defaults to guest role — chat is allowed."""
         ctx = {"chat_id": "777", "is_command": False, "message": "hello"}
         result = await h.handle("before_message", ctx)
         assert result["allow"] is True
+
+    @pytest.mark.asyncio
+    async def test_unlisted_auto_guest_terminal_denied(self, mock_config):
+        """Unlisted user defaults to guest — terminal/system commands blocked."""
+        ctx = {"chat_id": "777", "is_command": True, "command": "terminal",
+               "message": "/terminal ls"}
+        result = await h.handle("before_message", ctx)
+        assert result["allow"] is False
 
     @pytest.mark.asyncio
     async def test_unlisted_denied_when_deny_unlisted_true(self):

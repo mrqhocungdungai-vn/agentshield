@@ -461,7 +461,10 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
         if config.get("deny_unlisted", False):
             reason = messages.get("unlisted_denied", "You don't have access to this agent.")
             return {"allow": False, "reason": reason}
-        return {"allow": True}
+        # Auto-guest: apply guest role limits to unlisted users instead of
+        # passing through freely. This ensures every stranger is rate-limited
+        # and restricted to safe actions even without explicit assignment.
+        role = "guest"
 
     # ── Known role — rate limit check ─────────────────────────────────────
     role_cfg = config.get("roles", {}).get(role, {})

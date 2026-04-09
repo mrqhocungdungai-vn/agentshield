@@ -163,16 +163,31 @@ Unknown users automatically fall into `guest`. No whitelist configuration needed
 
 ---
 
-## Admin Commands
+## Management
 
-Send from the Telegram account set as `owner_chat_id`:
+All management is done **directly on the server via CLI** — there are no admin commands over Telegram.
 
-| Command | Description |
-|---------|-------------|
-| `/as_assign <chat_id> <role>` | Dynamically assign a role (persisted to disk) |
-| `/as_revoke <chat_id>` | Remove a dynamic role assignment |
-| `/as_roles` | List all dynamic assignments |
-| `/as_info <chat_id>` | Show role and rate-limit state for a user |
+```bash
+# SSH into the server
+ssh user@your-server
+
+# Edit roles, rate limits, messages
+nano ~/.hermes/agentshield.yaml
+
+# View conversation logs
+ls ~/.hermes/logs/conversations/
+cat ~/.hermes/logs/conversations/<chat_id>.jsonl
+
+# Restart gateway to apply config changes
+hermes gateway restart
+
+# View dynamic role assignments (set via future admin tooling)
+cat ~/.hermes/agentshield_roles.json
+```
+
+> **Note:** Telegram-based admin commands (`/as_assign`, `/as_roles`, etc.) exist in the codebase
+> but are not active in the current deployment. Admin role management via Telegram is planned
+> for a future release. For now, all administration is CLI-only.
 
 ---
 

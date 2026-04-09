@@ -57,10 +57,10 @@ agentshield:
     conversations: true   # log every turn to ~/.hermes/logs/conversations/
 
   messages:
-    rate_limit_minute: "⏳ Bạn gửi tin nhắn quá nhanh. Vui lòng chờ 1 phút."
-    rate_limit_day: "📵 Bạn đã đạt giới hạn tin nhắn hôm nay. Thử lại vào ngày mai."
-    action_denied: "🚫 Bạn không có quyền thực hiện hành động này."
-    unlisted_denied: "❌ Bạn chưa được cấp quyền truy cập agent này."
+    rate_limit_minute: "⏳ You are sending messages too fast. Please wait a minute."
+    rate_limit_day: "📵 You have reached today's message limit. Please try again tomorrow."
+    action_denied: "🚫 You do not have permission to perform this action."
+    unlisted_denied: "❌ You do not have access to this agent."
 """
 
 from __future__ import annotations

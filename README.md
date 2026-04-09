@@ -2,86 +2,87 @@
 
 **Role-based access control middleware for [Hermes Agent](https://github.com/NousResearch/hermes-agent)**
 
-AgentShield biến Hermes thành một agent có thể phục vụ khách hàng bên ngoài — an toàn, có giới hạn, và kiếm được tiền — mà không cần fork hay sửa source code của Hermes.
+AgentShield turns Hermes into a customer-facing agent — safe, rate-limited, and revenue-ready — without forking or modifying Hermes source code.
 
 ```
-Khách hàng nhắn tin (Telegram/Discord/...)
+Customer sends message (Telegram/Discord/...)
           ↓
 Hermes Gateway
           ↓
 AgentShield hook (before_message)
-   → Xác định role
-   → Kiểm tra rate limit
-   → Kiểm tra quyền hành động
-          ↓ allow              ↓ deny
-Agent xử lý bình thường    Khách nhận message lịch sự
+   → Resolve role
+   → Check rate limit
+   → Check action permission
+          ↓ allow                  ↓ deny
+Agent processes normally     Customer gets a polite message
           ↓
 AgentShield hook (agent:end)
-   → Ghi log cuộc trò chuyện
+   → Log conversation turn
 ```
 
 ---
 
-## Tính năng
+## Features
 
-- **RBAC** — phân quyền theo role với allow/deny patterns (`chat`, `skill:*`, `command:*`)
-- **Rate limiting** — giới hạn tin nhắn theo phút và theo ngày cho từng role
-- **Action inference** — phân biệt `chat`, `command:x`, `skill:x`, `system:reset`, `system:stop`
-- **Auto-guest** — người lạ tự động vào role guest, không cần cấu hình whitelist
-- **Persistent role assignments** — assign role qua lệnh `/as_assign`, lưu qua restart
-- **Conversation logging** — mỗi turn ghi vào `~/.hermes/logs/conversations/<chat_id>.jsonl`
-- **Owner alerts** — cảnh báo Telegram khi có hành vi bất thường
-- **Zero-fork** — chỉ là một hook file, không cần sửa Hermes
-
----
-
-## Kiến trúc triển khai
-
-AgentShield được thiết kế cho mô hình **customer-facing agent**:
-
-```
-Chủ nhân (Owner)
-  → Tương tác với agent qua CLI trực tiếp trên server
-  → Toàn quyền, full tools
-
-Khách hàng (Guest)
-  → Tương tác qua Telegram/messaging platform
-  → Chỉ được chat, rate-limited, không có tools nguy hiểm
-```
-
-Hermes config dùng `platform_toolsets.telegram: [safe]` để loại bỏ hoàn toàn
-`terminal`, `file`, `process` tool schema — AgentShield chặn ở tầng message,
-Hermes config chặn ở tầng tool. Hai lớp độc lập.
+- **RBAC** — per-role allow/deny patterns (`chat`, `skill:*`, `command:*`)
+- **Rate limiting** — per-minute and per-day limits per role
+- **Action inference** — distinguishes `chat`, `command:x`, `skill:x`, `system:reset`, `system:stop`
+- **Auto-guest** — unknown users automatically fall into the `guest` role, no whitelist needed
+- **Persistent role assignments** — assign roles via `/as_assign`, survives gateway restarts
+- **Conversation logging** — every turn logged to `~/.hermes/logs/conversations/<chat_id>.jsonl`
+- **Owner alerts** — Telegram notification when suspicious actions are blocked
+- **Zero-fork** — a single hook file, no changes to Hermes required
 
 ---
 
-## Cài đặt
+## Deployment Architecture
 
-### Yêu cầu
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) đã cài và chạy
+AgentShield is designed for the **customer-facing agent** model:
+
+```
+Owner
+  → Interacts with agent via CLI directly on the server
+  → Full tools, no restrictions
+
+Customers
+  → Interact via Telegram / messaging platform
+  → Chat only, rate-limited, no dangerous tools exposed
+```
+
+Hermes config uses `platform_toolsets.telegram: [safe]` to completely remove
+`terminal`, `file`, and `process` tool schemas from the agent's context.
+AgentShield blocks at the **message layer**, Hermes config blocks at the **tool layer**.
+Two independent layers of defense.
+
+---
+
+## Installation
+
+### Requirements
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) installed and running
 - Python 3.9+
 - PyYAML (`pip install pyyaml`)
 
-### Bước 1 — Clone repo
+### Step 1 — Clone the repo
 
 ```bash
 git clone https://github.com/mrqhocungdungai-vn/agentshield
 cd agentshield
 ```
 
-### Bước 2 — Chạy install script
+### Step 2 — Run the install script
 
 ```bash
 bash install.sh
 ```
 
-Script sẽ:
-- Copy `hook/handler.py` và `hook/HOOK.yaml` vào `~/.hermes/hooks/agentshield/`
-- Tạo file config mẫu tại `~/.hermes/agentshield.yaml` (nếu chưa có)
+This will:
+- Copy `hook/handler.py` and `hook/HOOK.yaml` into `~/.hermes/hooks/agentshield/`
+- Create a default config at `~/.hermes/agentshield.yaml` (if not already present)
 
-### Bước 3 — Cấu hình
+### Step 3 — Configure AgentShield
 
-Chỉnh sửa `~/.hermes/agentshield.yaml`:
+Edit `~/.hermes/agentshield.yaml`:
 
 ```yaml
 agentshield:
@@ -97,85 +98,85 @@ agentshield:
         messages_per_day: 200
 
   messages:
-    rate_limit_minute: "Mình đang xử lý khá nhiều tin nhắn, bạn chờ một chút rồi nhắn lại nhé 😊"
-    rate_limit_day: "Hôm nay mình đã hỗ trợ bạn khá nhiều rồi. Hẹn gặp lại ngày mai nhé!"
-    action_denied: "Tính năng này không khả dụng trong kênh chat. Vui lòng liên hệ nhân viên hỗ trợ nhé 😊"
+    rate_limit_minute: "I'm handling a lot of messages right now — please try again in a moment 😊"
+    rate_limit_day: "You've reached today's message limit. Feel free to continue tomorrow!"
+    action_denied: "That feature isn't available in this chat. Please contact our support team 😊"
 ```
 
-### Bước 4 — Cấu hình Hermes
+### Step 4 — Configure Hermes
 
-Trong `~/.hermes/config.yaml`, đổi toolset Telegram sang `safe` để loại bỏ tools nguy hiểm:
+In `~/.hermes/config.yaml`, switch the Telegram toolset to `safe` to remove dangerous tools:
 
 ```yaml
 platform_toolsets:
   telegram:
-    - safe    # web + vision only, không có terminal/file/process
+    - safe    # web + vision only — no terminal/file/process
 ```
 
-Và cho phép mọi user Telegram đi qua (AgentShield sẽ tự kiểm soát):
+Allow all Telegram users through Hermes (AgentShield handles access control):
 
 ```bash
-# Thêm vào ~/.hermes/.env
+# Add to ~/.hermes/.env
 TELEGRAM_ALLOW_ALL_USERS=true
 ```
 
-### Bước 5 — Restart gateway
+### Step 5 — Restart the gateway
 
 ```bash
 hermes gateway restart
 ```
 
-Kiểm tra hook đã load:
+Verify the hook loaded:
 
 ```bash
 journalctl --user -u hermes-gateway -n 20 | grep agentshield
-# Kết quả mong đợi:
+# Expected output:
 # [hooks] Loaded hook 'agentshield' for events: ['before_message', 'agent:end']
 ```
 
 ---
 
-## Cấu hình đầy đủ
+## Full Configuration Reference
 
-Xem [`config/agentshield.yaml.example`](config/agentshield.yaml.example) để có ví dụ đầy đủ với nhiều role.
+See [`config/agentshield.yaml.example`](config/agentshield.yaml.example) for a full example with multiple roles.
 
 ### Role system
 
-| Role | Mô tả |
-|------|-------|
-| `owner` | Bypass mọi check, có thể dùng `/as_*` admin commands |
-| `admin` | Full quyền, rate limit cao |
-| `user` | Chat + skill + một số lệnh an toàn |
-| `guest` | Chỉ chat, rate limit thấp — default cho người lạ |
+| Role | Description |
+|------|-------------|
+| `owner` | Bypasses all checks, can use `/as_*` admin commands |
+| `admin` | Full access, high rate limits |
+| `user` | Chat + skills + safe commands |
+| `guest` | Chat only, low rate limits — default for unknown users |
 
-Người lạ (unlisted) tự động vào role `guest`. Không cần cấu hình whitelist.
+Unknown users automatically fall into `guest`. No whitelist configuration needed.
 
 ### Action types
 
-| Action | Khi nào |
-|--------|---------|
-| `chat` | Tin nhắn thường |
-| `command:<name>` | Slash command (VD: `/help` → `command:help`) |
-| `skill:<name>` | Chạy skill (VD: `/skill run summarize`) |
+| Action | Triggered when |
+|--------|---------------|
+| `chat` | Regular text message |
+| `command:<name>` | Slash command (e.g. `/help` → `command:help`) |
+| `skill:<name>` | Skill invocation (e.g. `/skill run summarize`) |
 | `system:reset` | `/reset`, `/new`, `/clear` |
 | `system:stop` | `/stop`, `/cancel` |
 
 ---
 
-## Admin commands (nếu dùng owner role)
+## Admin Commands
 
-Gửi từ Telegram account có `owner_chat_id`:
+Send from the Telegram account set as `owner_chat_id`:
 
-| Lệnh | Mô tả |
-|------|-------|
-| `/as_assign <chat_id> <role>` | Assign role động (lưu qua restart) |
-| `/as_revoke <chat_id>` | Xóa dynamic assignment |
-| `/as_roles` | Xem tất cả dynamic assignments |
-| `/as_info <chat_id>` | Xem role + rate state của user |
+| Command | Description |
+|---------|-------------|
+| `/as_assign <chat_id> <role>` | Dynamically assign a role (persisted to disk) |
+| `/as_revoke <chat_id>` | Remove a dynamic role assignment |
+| `/as_roles` | List all dynamic assignments |
+| `/as_info <chat_id>` | Show role and rate-limit state for a user |
 
 ---
 
-## Chạy tests
+## Running Tests
 
 ```bash
 pip install pytest pytest-asyncio pyyaml
@@ -184,38 +185,36 @@ pytest tests/ -v
 
 ---
 
-## Mục tiêu dự án
+## Project Goal
 
-> Biến Hermes Agent thành một **nhân viên AI có thể kiếm tiền** phục vụ khách hàng thực tế — tư vấn, chăm sóc, hỗ trợ 24/7 — trong khi vẫn giữ an toàn tuyệt đối cho hệ thống bên trong.
+> Turn Hermes Agent into an **AI employee that can generate revenue** — handling customer inquiries, support, and consultation 24/7 — while keeping the underlying system completely secure.
 
-AgentShield là lớp giáp bảo vệ để agent có thể "ra ngoài làm việc" mà chủ nhân không lo bị khai thác.
+AgentShield is the armor that lets the agent work in the real world without exposing the owner's infrastructure.
 
 ---
 
-## Liên hệ & theo dõi
-
-Dự án được chia sẻ công khai để cộng đồng tham khảo và đóng góp.
+## Contact & Follow
 
 - **TikTok:** [@mr.q.hoc.ung.dung.ai](https://www.tiktok.com/@mr.q.hoc.ung.dung.ai)
 - **GitHub:** [mrqhocungdungai-vn/agentshield](https://github.com/mrqhocungdungai-vn/agentshield)
 
 ---
 
-## Đóng góp
+## Contributing
 
-Pull requests và issues luôn được chào đón.
+Pull requests and issues are welcome.
 
 ---
 
-> ⚠️ **Lưu ý từ tác giả**
+> ⚠️ **A note from the author**
 >
-> Repo này được xây dựng bởi **Hermes Agent** — dưới sự điều phối của một kỹ sư ICT không chuyên về lập trình.
-> Mục tiêu là thực tế và học hỏi, không phải production-perfect.
+> This project was built by **Hermes Agent itself**, guided by an ICT engineer who is not a professional developer.
+> The goal is practical and learning-oriented — not production-perfect.
 >
-> Chắc chắn còn nhiều vấn đề cần cải thiện — về security, performance, edge cases, và code quality.
-> Nếu bạn là developer và thấy điều gì cần fix hoặc làm tốt hơn, **issues và PRs luôn được chào đón**.
+> There are likely gaps in security hardening, edge case handling, and code quality.
+> If you are a developer and see something worth improving, **issues and PRs are very welcome**.
 >
-> Cùng nhau xây dựng một công cụ để AI agent có thể làm việc thực sự — an toàn, hiệu quả, và sinh ra giá trị.
+> Let's build something that lets AI agents do real work — safely, reliably, and profitably.
 
 ---
 

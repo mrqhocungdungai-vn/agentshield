@@ -1,42 +1,25 @@
 agentshield:
   enabled: true
 
-  # Owner chat_id — always bypasses all checks and can run /as_* admin commands
-  owner_chat_id: "8347964125"
+  # Không có owner qua Telegram — chủ nhân dùng CLI trực tiếp trên máy
+  # owner_chat_id: disabled
 
-  # If true, users not listed in any role get denied.
-  # If false (default), unlisted users fall back to guest role automatically.
+  # Tất cả user qua Telegram đều là guest — không có phân biệt role
   deny_unlisted: false
 
   roles:
-    admin:
-      chat_ids: []
-      allow: ["*"]
-      rate_limit:
-        messages_per_minute: 60
-        messages_per_day: 2000
-
-    user:
-      chat_ids: []
-      allow: ["chat", "skill:*", "command:help", "command:new", "command:reset"]
-      deny: ["terminal", "system:stop"]
-      rate_limit:
-        messages_per_minute: 10
-        messages_per_day: 200
-
     guest:
       chat_ids: []
       allow: ["chat"]
+      deny: ["command:*", "system:*", "terminal", "skill:*"]
       rate_limit:
         messages_per_minute: 10
         messages_per_day: 200
 
-  # Owner alert settings
   alerts:
-    on_action_denied: true    # notify owner when someone tries a blocked command
-    on_rate_limit: false      # notify owner on rate limit hits (can be noisy)
+    on_action_denied: false   # không có owner Telegram để nhận alert
+    on_rate_limit: false
 
-  # Messages shown to customers — keep friendly and professional
   messages:
     rate_limit_minute: "Mình đang xử lý khá nhiều tin nhắn cùng lúc, bạn vui lòng chờ một chút rồi nhắn lại nhé 😊"
     rate_limit_day: "Hôm nay mình đã hỗ trợ bạn khá nhiều rồi. Bạn có thể tiếp tục trò chuyện vào ngày mai, hoặc liên hệ trực tiếp với đội ngũ hỗ trợ của chúng tôi nhé!"

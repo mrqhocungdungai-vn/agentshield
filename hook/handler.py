@@ -69,6 +69,8 @@ import fnmatch
 import json
 import os
 import time
+import urllib.request
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -138,6 +140,47 @@ def _save_dynamic_roles(assignments: Dict[str, str]) -> None:
         tmp.replace(path)
     except Exception as e:
         print(f"[agentshield] Failed to save role assignments: {e}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Telegram alert helper
+# ---------------------------------------------------------------------------
+
+def _send_telegram_alert(token: str, chat_id: str, text: str) -> None:
+    """Send a message to owner via Telegram Bot API (stdlib only, no httpx)."""
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = json.dumps({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"[agentshield] Telegram alert failed: {e}", flush=True)
+
+
+def _notify_owner(config: Dict[str, Any], event: str, chat_id: str, detail: str) -> None:
+    """Send security alert to owner if bot token is available."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    owner_id = str(config.get("owner_chat_id", ""))
+    if not token or not owner_id:
+        return
+    emoji_map = {
+        "action_denied": "🚫",
+        "rate_limit_minute": "⏳",
+        "rate_limit_day": "📵",
+    }
+    emoji = emoji_map.get(event, "⚠️")
+    text = (
+        f"{emoji} <b>AgentShield Alert</b>\n"
+        f"Event: <code>{event}</code>\n"
+        f"User: <code>{chat_id}</code>\n"
+        f"Detail: {detail}"
+    )
+    _send_telegram_alert(token, owner_id, text)
 
 
 # ---------------------------------------------------------------------------
@@ -473,12 +516,22 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
         limit_key = _check_rate_limit(chat_id, rate_limits)
         if limit_key:
             reason = messages.get(limit_key, "Rate limit exceeded. Please try again later.")
+            # Alert owner nếu được bật trong config
+            alerts = config.get("alerts", {})
+            if alerts.get("on_rate_limit", False):
+                _notify_owner(config, limit_key, chat_id, f"role={role}")
             return {"allow": False, "reason": reason}
 
     # ── Action permission check ───────────────────────────────────────────
     action = _infer_action(context)
     if not _is_action_allowed(action, role_cfg):
-        reason = messages.get("action_denied", "You don't have permission to do that.")
+        reason = messages.get("action_denied", "You don't have permission for that.")
+        # Luôn alert owner khi có người cố dùng lệnh bị chặn
+        alerts = config.get("alerts", {})
+        if alerts.get("on_action_denied", True):
+            user_msg = context.get("message", "")[:80]
+            _notify_owner(config, "action_denied", chat_id,
+                          f"role={role} action={action} msg=\"{user_msg}\"")
         return {"allow": False, "reason": reason}
 
     # ── All checks passed ─────────────────────────────────────────────────

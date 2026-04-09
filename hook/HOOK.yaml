@@ -1,0 +1,11 @@
+name: agentshield
+description: >
+  Role-based access control for Hermes gateway messages.
+  Applies per-role allowlists, denylists, rate limits, and action guards
+  before any message reaches the agent.
+  Supports persistent role assignments and per-user conversation logging.
+  Config: ~/.hermes/agentshield.yaml
+events:
+  - before_message
+  - agent:end
+version: "0.2.0"

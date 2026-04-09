@@ -1,0 +1,44 @@
+agentshield:
+  # Set to false to temporarily disable AgentShield without removing the hook
+  enabled: true
+
+  # Your Telegram chat_id — always bypasses all checks and can run /as_* admin commands
+  # Get your chat_id by messaging @userinfobot on Telegram
+  owner_chat_id: "YOUR_TELEGRAM_CHAT_ID"
+
+  # If true, users not listed in any role get denied.
+  # If false (default), unlisted users pass through — Hermes handles its own allowlist.
+  deny_unlisted: false
+
+  roles:
+    admin:
+      chat_ids: []  # Add trusted admin chat_ids here
+      allow: ["*"]  # All actions allowed
+      rate_limit:
+        messages_per_minute: 60
+        messages_per_day: 2000
+
+    user:
+      chat_ids: []  # Add paying customer chat_ids here (or use /as_assign at runtime)
+      allow: ["chat", "skill:*", "command:help", "command:new", "command:reset"]
+      deny: ["terminal", "system:stop"]
+      rate_limit:
+        messages_per_minute: 10
+        messages_per_day: 200
+
+    guest:
+      chat_ids: []  # Add guest chat_ids here (or leave empty for deny_unlisted: false)
+      allow: ["chat"]
+      rate_limit:
+        messages_per_minute: 3
+        messages_per_day: 30
+
+  logging:
+    conversations: true  # Log every turn to ~/.hermes/logs/conversations/<chat_id>.jsonl
+
+  # Messages sent to users when a request is denied (customize to your language)
+  messages:
+    rate_limit_minute: "⏳ Bạn gửi tin nhắn quá nhanh. Vui lòng chờ 1 phút."
+    rate_limit_day: "📵 Bạn đã đạt giới hạn tin nhắn hôm nay. Thử lại vào ngày mai."
+    action_denied: "🚫 Bạn không có quyền thực hiện hành động này."
+    unlisted_denied: "❌ Bạn chưa được cấp quyền truy cập agent này."

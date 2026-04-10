@@ -11,6 +11,16 @@ agentshield:
   # true            — block all users not explicitly assigned a role.
   deny_unlisted: false
 
+  # MRQ-30: Top-level rate limiting defaults.
+  # These apply as fallbacks when a role has no rate_limit defined.
+  # roles.<name>: 0 means unlimited for that role.
+  rate_limiting:
+    enabled: true
+    default_limit: 20      # messages per minute (fallback for roles without rate_limit)
+    window_seconds: 60
+    roles:
+      admin: 0             # 0 = unlimited — admin role is never rate-limited
+
   roles:
     # guest — the only active role. Every external user is a guest.
     # Restrict what guests can do and how fast they can send messages.
@@ -29,6 +39,19 @@ agentshield:
       rate_limit:
         messages_per_minute: 10
         messages_per_day: 200
+      # MRQ-31: toolsets controls which tool sets the agent uses for this role.
+      # Empty list = no tools beyond base chat.
+      # Example: toolsets: ["safe", "web"]
+      toolsets: []
+
+    # Example: premium role with extended toolsets and higher rate limits
+    # premium:
+    #   allow: ["chat"]
+    #   deny: []
+    #   rate_limit:
+    #     messages_per_minute: 50
+    #     messages_per_day: 1000
+    #   toolsets: ["safe", "web"]
 
   # TODO: owner role — when owner bypass is implemented, the owner will be
   # able to receive alerts here even if owner_chat_id is set.
@@ -38,9 +61,51 @@ agentshield:
 
   logging:
     conversations: true   # log every turn to ~/.hermes/logs/conversations/
+    max_bytes_per_user: 10485760   # 10 MB per user log file (soft cap, oldest lines dropped)
 
   messages:
     rate_limit_minute: "I'm handling a lot of messages right now — please try again in a moment 😊"
     rate_limit_day: "You've reached today's message limit. Feel free to continue tomorrow!"
     action_denied: "That feature isn't available in this chat. Please contact our support team 😊"
     unlisted_denied: "Hello! This channel is currently in private beta. Please reach out through our official channels."
+
+  # MRQ-32: Prompt injection guard.
+  # Blocks messages that contain known prompt injection patterns.
+  # Pattern matching is case-insensitive substring match.
+  injection_guard:
+    enabled: true
+    # Default patterns if not specified here:
+    #   - "ignore all previous instructions"
+    #   - "you are now"
+    #   - "act as"
+    #   - "repeat your system prompt"
+    #   - "jailbreak"
+    #   - "DAN mode"
+    #   - "ignore previous"
+    #   - "disregard your instructions"
+    patterns:
+      - "ignore all previous instructions"
+      - "you are now"
+      - "act as"
+      - "repeat your system prompt"
+      - "jailbreak"
+      - "DAN mode"
+      - "ignore previous"
+      - "disregard your instructions"
+    # Optional: override the block message shown to the user
+    block_message: "Tin nhắn của bạn không được xử lý."
+
+  # MRQ-33: Human escalation detection.
+  # When a user requests a human agent, block the message and notify the owner.
+  escalation:
+    enabled: true
+    message: "Đang kết nối nhân viên hỗ trợ, vui lòng chờ trong giây lát..."
+    keywords:
+      - "nói chuyện với người"
+      - "muốn gặp nhân viên"
+      - "/human"
+      - "speak to human"
+      - "talk to human"
+      - "human agent"
+      - "gặp nhân viên"
+      - "chuyển cho người"

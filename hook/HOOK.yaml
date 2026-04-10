@@ -4,8 +4,12 @@ description: >
   Applies per-role allowlists, denylists, rate limits, and action guards
   before any message reaches the agent.
   Supports persistent role assignments and per-user conversation logging.
+  MRQ-30: top-level rate limiting defaults with per-role overrides.
+  MRQ-31: per-role toolset RBAC (toolsets field in role config).
+  MRQ-32: prompt injection guard with configurable pattern list.
+  MRQ-33: human escalation detection with owner alert.
   Config: ~/.hermes/agentshield.yaml
 events:
   - before_message
   - agent:end
-version: "0.2.0"
+version: "0.4.0"

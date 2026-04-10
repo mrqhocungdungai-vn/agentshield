@@ -1,5 +1,5 @@
 """
-AgentShield — Hermes before_message hook  (v0.3.1)
+AgentShield — Hermes before_message hook  (v0.4.0)
 ====================================================
 Role-based access control middleware for Hermes Gateway.
 
@@ -13,13 +13,17 @@ Features
 --------
 - Auto-guest: all users fall into guest by default — no whitelist needed
 - Per-role rate limiting  (messages per minute + messages per day) — thread-safe
+  * MRQ-30: top-level rate_limiting block with default_limit/window_seconds fallback
 - Action inference from message context (chat / command:x / skill:x / system:*)
 - Per-role allow/deny lists with wildcard patterns (fnmatch)
 - Persistent role assignments  →  ~/.hermes/agentshield_roles.json
 - Per-user conversation logging → ~/.hermes/logs/conversations/<chat_id>.jsonl
   with soft size cap (LOG_MAX_BYTES per user, configurable via config.logging.max_bytes_per_user)
-- Owner alerts via Telegram Bot API on action_denied / rate_limit events
+- Owner alerts via Telegram Bot API on action_denied / rate_limit / escalation events
 - Unbounded _rate_state cleanup: entries not seen for >24h are evicted periodically
+- MRQ-31: Per-role toolset control via RBAC (toolsets field in role config)
+- MRQ-32: Prompt injection guard (case-insensitive pattern matching)
+- MRQ-33: Human escalation detection with owner alert
 
 Config file: ~/.hermes/agentshield.yaml
 
@@ -33,6 +37,14 @@ agentshield:
 
   deny_unlisted: false   # false = everyone gets guest. true = block unknown users.
 
+  # MRQ-30: top-level rate limiting defaults (fallback when role has no rate_limit)
+  rate_limiting:
+    enabled: true
+    default_limit: 20        # messages per minute (fallback)
+    window_seconds: 60
+    roles:
+      admin: 0               # 0 = unlimited
+
   roles:
     guest:
       chat_ids: []        # not used for guest (all unknown users → guest)
@@ -41,6 +53,7 @@ agentshield:
       rate_limit:
         messages_per_minute: 10
         messages_per_day: 200
+      toolsets: []        # MRQ-31: empty = no tools beyond base chat
 
   alerts:
     on_action_denied: true
@@ -55,11 +68,40 @@ agentshield:
     rate_limit_day: "You've reached today's message limit. Feel free to continue tomorrow!"
     action_denied: "That feature isn't available in this chat. Please contact our support team 😊"
     unlisted_denied: "You do not have access to this agent."
+
+  # MRQ-32: Prompt injection guard
+  injection_guard:
+    enabled: true
+    patterns:
+      - "ignore all previous instructions"
+      - "you are now"
+      - "act as"
+      - "repeat your system prompt"
+      - "jailbreak"
+      - "DAN mode"
+      - "ignore previous"
+      - "disregard your instructions"
+    block_message: "Tin nhắn của bạn không được xử lý."
+
+  # MRQ-33: Human escalation
+  escalation:
+    enabled: true
+    message: "Đang kết nối nhân viên hỗ trợ, vui lòng chờ trong giây lát..."
+    keywords:
+      - "nói chuyện với người"
+      - "muốn gặp nhân viên"
+      - "/human"
+      - "speak to human"
+      - "talk to human"
+      - "human agent"
+      - "gặp nhân viên"
+      - "chuyển cho người"
 """
 
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import threading
@@ -83,6 +125,30 @@ _LOG_DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 
 # Evict _rate_state entries not seen for this many seconds (to prevent unbounded growth).
 _RATE_STATE_TTL = 86400 * 2  # 2 days
+
+# Default injection guard patterns (MRQ-32)
+_DEFAULT_INJECTION_PATTERNS = [
+    "ignore all previous instructions",
+    "you are now",
+    "act as",
+    "repeat your system prompt",
+    "jailbreak",
+    "DAN mode",
+    "ignore previous",
+    "disregard your instructions",
+]
+
+# Default human escalation keywords (MRQ-33)
+_DEFAULT_ESCALATION_KEYWORDS = [
+    "nói chuyện với người",
+    "muốn gặp nhân viên",
+    "/human",
+    "speak to human",
+    "talk to human",
+    "human agent",
+    "gặp nhân viên",
+    "chuyển cho người",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +257,7 @@ def _notify_owner(config: Dict[str, Any], event: str, chat_id: str, detail: str)
         "action_denied": "🚫",
         "rate_limit_minute": "⏳",
         "rate_limit_day": "📵",
+        "escalation": "🆘",
     }
     emoji = emoji_map.get(event, "⚠️")
     text = (
@@ -233,28 +300,45 @@ def _evict_stale_rate_entries() -> None:
         print(f"[agentshield] Evicted {len(stale)} stale rate-limit entries", flush=True)
 
 
-def _check_rate_limit(chat_id: str, limits: Dict[str, int]) -> Optional[str]:
+def _check_rate_limit(chat_id: str, limits: Dict[str, int], config: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Check rate limits. Returns None if OK, or a message key if exceeded.
 
     Thread-safe: all reads and writes to _rate_state are protected by _rate_lock.
     Does NOT increment counters — call _record_message() after allowing.
+
+    MRQ-30: Falls back to top-level rate_limiting.default_limit if limits is empty.
+    A role with value 0 in rate_limiting.roles means unlimited (no rate limit).
     """
+    # MRQ-30: apply top-level defaults if limits dict is empty
+    effective_limits = dict(limits)
+    if not effective_limits and config is not None:
+        rl_cfg = config.get("rate_limiting", {})
+        if rl_cfg.get("enabled", True):
+            default_limit = rl_cfg.get("default_limit", 20)
+            window_seconds = rl_cfg.get("window_seconds", 60)
+            if default_limit:
+                effective_limits = {
+                    "messages_per_minute": default_limit,
+                    "_window_seconds": window_seconds,
+                }
+
     now = time.time()
     with _rate_lock:
         _evict_stale_rate_entries()
         state = _rate_state.setdefault(chat_id, {})
         state["_last_seen"] = now
 
-        per_min = limits.get("messages_per_minute")
+        per_min = effective_limits.get("messages_per_minute")
         if per_min:
+            window = effective_limits.get("_window_seconds", 60)
             bucket = state.setdefault("minute", {"ts": now, "count": 0})
-            if now - bucket["ts"] > 60:
+            if now - bucket["ts"] > window:
                 bucket["ts"] = now
                 bucket["count"] = 0
             if bucket["count"] >= per_min:
                 return "rate_limit_minute"
 
-        per_day = limits.get("messages_per_day")
+        per_day = effective_limits.get("messages_per_day")
         if per_day:
             bucket = state.setdefault("day", {"ts": now, "count": 0})
             if now - bucket["ts"] > 86400:
@@ -373,6 +457,109 @@ def _is_action_allowed(action: str, role_cfg: Dict[str, Any]) -> bool:
 
     # Empty allow list = no restrictions defined = allow
     return len(allow_patterns) == 0
+
+
+# ---------------------------------------------------------------------------
+# MRQ-31: Per-role toolset resolution via RBAC
+# ---------------------------------------------------------------------------
+
+def _get_role_toolsets(role_name: str, role_cfg: Dict[str, Any]) -> List[str]:
+    """Return the toolsets list for a role, defaulting to [] if not specified.
+
+    MRQ-31: toolsets field in role config controls which tool sets the agent
+    may use for that role. An empty list means no tools beyond base chat.
+    """
+    return list(role_cfg.get("toolsets", []))
+
+
+# ---------------------------------------------------------------------------
+# MRQ-32: Prompt injection guard
+# ---------------------------------------------------------------------------
+
+def _check_prompt_injection(
+    message: str,
+    chat_id: str,
+    config: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Detect prompt injection attempts. Returns block response dict or None.
+
+    Uses case-insensitive substring matching against configurable pattern list.
+    Logs user_id + SHA-256 hash of message (never the full message content).
+
+    Returns:
+        None if the message is safe.
+        {"allow": False, "reason": "..."} if injection detected.
+    """
+    try:
+        guard_cfg = config.get("injection_guard", {})
+        if not guard_cfg.get("enabled", True):
+            return None
+
+        patterns = guard_cfg.get("patterns", _DEFAULT_INJECTION_PATTERNS)
+        msg_lower = message.lower()
+
+        for pattern in patterns:
+            if pattern.lower() in msg_lower:
+                # Log hash of message, NOT the full message
+                hash_val = hashlib.sha256(message.encode("utf-8")).hexdigest()[:16]
+                print(
+                    f"[agentshield] Injection attempt from {chat_id}: hash={hash_val}",
+                    flush=True,
+                )
+                block_msg = guard_cfg.get(
+                    "block_message",
+                    "Tin nhắn của bạn không được xử lý.",
+                )
+                return {"allow": False, "reason": block_msg}
+
+        return None
+    except Exception as e:
+        print(f"[agentshield] Injection guard error: {e}", flush=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# MRQ-33: Human escalation detection
+# ---------------------------------------------------------------------------
+
+def _check_human_escalation(
+    message: str,
+    chat_id: str,
+    config: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Detect human escalation requests. Returns block response dict or None.
+
+    On keyword match:
+    1. Returns {"allow": False, "reason": escalation_message}
+    2. Notifies owner via Telegram with escalation alert
+
+    Returns:
+        None if no escalation keyword found.
+        {"allow": False, "reason": "..."} if escalation detected.
+    """
+    try:
+        esc_cfg = config.get("escalation", {})
+        if not esc_cfg.get("enabled", True):
+            return None
+
+        keywords = esc_cfg.get("keywords", _DEFAULT_ESCALATION_KEYWORDS)
+        msg_lower = message.lower()
+
+        for keyword in keywords:
+            if keyword.lower() in msg_lower:
+                escalation_msg = esc_cfg.get(
+                    "message",
+                    "Đang kết nối nhân viên hỗ trợ, vui lòng chờ trong giây lát...",
+                )
+                # Notify owner
+                detail = f"[ESCALATION] User {chat_id} cần hỗ trợ từ người. Keyword: {keyword}"
+                _notify_owner(config, "escalation", chat_id, detail)
+                return {"allow": False, "reason": escalation_msg}
+
+        return None
+    except Exception as e:
+        print(f"[agentshield] Escalation check error: {e}", flush=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +735,7 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         {"allow": True}                     — message proceeds to agent
         {"allow": False, "reason": "..."}   — blocked, reason sent to user
+        {"allow": True, "enabled_toolsets": [...]}  — MRQ-31: toolsets for agent
 
     This function NEVER raises. Any unexpected exception is caught, logged,
     and treated as allow=True (fail-open) to prevent dropping customer messages.
@@ -614,11 +802,34 @@ async def _handle_inner(event_type: str, context: Dict[str, Any]) -> Dict[str, A
         # All unlisted users fall into guest — the only active role.
         role = "guest"
 
-    # ── Guest role — rate limit check ─────────────────────────────────────
     role_cfg = config.get("roles", {}).get(role, {})
+    message_text = context.get("message", "")
+
+    # ── MRQ-32: Prompt injection guard (before action check) ───────────────
+    injection_result = _check_prompt_injection(message_text, chat_id, config)
+    if injection_result is not None:
+        return injection_result
+
+    # ── MRQ-33: Human escalation (after injection guard, before rate limit) ─
+    escalation_result = _check_human_escalation(message_text, chat_id, config)
+    if escalation_result is not None:
+        return escalation_result
+
+    # ── Guest role — rate limit check ─────────────────────────────────────
     rate_limits = role_cfg.get("rate_limit", {})
-    if rate_limits:
-        limit_key = _check_rate_limit(chat_id, rate_limits)
+
+    # MRQ-30: check if this role is unlimited in rate_limiting.roles
+    rl_cfg = config.get("rate_limiting", {})
+    role_override = rl_cfg.get("roles", {}).get(role)
+    if role_override == 0:
+        # 0 = unlimited — skip rate limit check
+        rate_limits = {}
+        skip_rate_limit = True
+    else:
+        skip_rate_limit = False
+
+    if not skip_rate_limit and (rate_limits or rl_cfg):
+        limit_key = _check_rate_limit(chat_id, rate_limits, config)
         if limit_key:
             reason = messages.get(limit_key, "Rate limit exceeded. Please try again later.")
             alerts = config.get("alerts", {})
@@ -639,4 +850,10 @@ async def _handle_inner(event_type: str, context: Dict[str, Any]) -> Dict[str, A
 
     # ── All checks passed ─────────────────────────────────────────────────
     _record_message(chat_id)
+
+    # ── MRQ-31: Return toolsets if configured for this role ────────────────
+    toolsets = _get_role_toolsets(role, role_cfg)
+    if toolsets:
+        return {"allow": True, "enabled_toolsets": toolsets}
+
     return {"allow": True}

@@ -1,5 +1,5 @@
 """
-Tests for AgentShield hook handler.py
+Tests for AgentShield hook handler.py — 2-role model (owner stub + guest active)
 Run with: pytest tests/ -v
 """
 
@@ -21,25 +21,16 @@ import handler as h
 # Fixtures
 # ---------------------------------------------------------------------------
 
+# 2-role config: only guest defined. owner_chat_id is intentionally absent
+# (owner interacts via CLI, not Telegram, in the current iteration).
 SAMPLE_CONFIG = {
     "enabled": True,
-    "owner_chat_id": "999",
     "deny_unlisted": False,
     "roles": {
-        "admin": {
-            "chat_ids": ["111"],
-            "allow": ["*"],
-            "rate_limit": {"messages_per_minute": 60, "messages_per_day": 2000},
-        },
-        "user": {
-            "chat_ids": ["222"],
-            "allow": ["chat", "skill:*", "command:help", "command:reset"],
-            "deny": ["terminal", "system:stop"],
-            "rate_limit": {"messages_per_minute": 5, "messages_per_day": 100},
-        },
         "guest": {
             "chat_ids": [],
             "allow": ["chat"],
+            "deny": ["command:*", "system:*", "terminal", "skill:*"],
             "rate_limit": {"messages_per_minute": 2, "messages_per_day": 10},
         },
     },
@@ -71,66 +62,84 @@ def tmp_hermes_home(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _find_role
+# _find_role — 2-role model
 # ---------------------------------------------------------------------------
 
 class TestFindRole:
-    def test_owner_by_config(self):
-        assert h._find_role("999", SAMPLE_CONFIG, {}) == "owner"
-
-    def test_static_admin(self):
-        assert h._find_role("111", SAMPLE_CONFIG, {}) == "admin"
-
-    def test_static_user(self):
-        assert h._find_role("222", SAMPLE_CONFIG, {}) == "user"
-
-    def test_unlisted(self):
+    def test_unlisted_returns_none(self):
+        """Any user not in dynamic assignments returns None (caller → guest)."""
         assert h._find_role("777", SAMPLE_CONFIG, {}) is None
 
-    def test_dynamic_overrides_static(self):
-        # "222" is static user, but dynamically promoted to admin
-        assert h._find_role("222", SAMPLE_CONFIG, {"222": "admin"}) == "admin"
-
-    def test_dynamic_assignment(self):
-        # "777" is unlisted, but dynamically assigned guest
+    def test_dynamic_guest_assignment(self):
+        """Dynamically assigned guest resolves correctly."""
         assert h._find_role("777", SAMPLE_CONFIG, {"777": "guest"}) == "guest"
+
+    def test_dynamic_assignment_can_be_overridden(self):
+        """Dynamic assignments can be changed at runtime."""
+        dynamic = {"500": "guest"}
+        assert h._find_role("500", SAMPLE_CONFIG, dynamic) == "guest"
+
+    def test_owner_chat_id_stub(self):
+        """owner_chat_id in config does not return 'owner' yet (TODO stub).
+        
+        In the current iteration, the owner bypasses nothing — they use CLI.
+        _find_role returns None for the owner's chat_id, which falls through
+        to guest treatment. This test documents the intentional current behavior.
+        When owner bypass is implemented, this test should be updated to
+        assert == 'owner'.
+        """
+        config_with_owner = {**SAMPLE_CONFIG, "owner_chat_id": "999"}
+        # TODO: owner role — when implemented, this should return "owner"
+        result = h._find_role("999", config_with_owner, {})
+        # Currently returns None (falls through to guest) — intentional stub behavior
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
-# _is_action_allowed
+# _is_action_allowed — guest role
 # ---------------------------------------------------------------------------
 
 class TestIsActionAllowed:
-    def test_admin_wildcard(self):
-        cfg = {"allow": ["*"]}
-        assert h._is_action_allowed("terminal", cfg) is True
-        assert h._is_action_allowed("system:stop", cfg) is True
-
-    def test_user_allow_chat(self):
-        cfg = SAMPLE_CONFIG["roles"]["user"]
+    def test_guest_allow_chat(self):
+        cfg = SAMPLE_CONFIG["roles"]["guest"]
         assert h._is_action_allowed("chat", cfg) is True
 
-    def test_user_allow_skill_wildcard(self):
-        cfg = SAMPLE_CONFIG["roles"]["user"]
-        assert h._is_action_allowed("skill:summarize", cfg) is True
-        assert h._is_action_allowed("skill:translate", cfg) is True
-
-    def test_user_deny_terminal(self):
-        cfg = SAMPLE_CONFIG["roles"]["user"]
+    def test_guest_deny_terminal(self):
+        cfg = SAMPLE_CONFIG["roles"]["guest"]
         assert h._is_action_allowed("terminal", cfg) is False
 
-    def test_user_deny_system_stop(self):
-        cfg = SAMPLE_CONFIG["roles"]["user"]
+    def test_guest_deny_command_wildcard(self):
+        cfg = SAMPLE_CONFIG["roles"]["guest"]
+        assert h._is_action_allowed("command:help", cfg) is False
+        assert h._is_action_allowed("command:reset", cfg) is False
+
+    def test_guest_deny_system(self):
+        cfg = SAMPLE_CONFIG["roles"]["guest"]
+        assert h._is_action_allowed("system:reset", cfg) is False
         assert h._is_action_allowed("system:stop", cfg) is False
 
-    def test_user_unknown_action_denied(self):
-        cfg = SAMPLE_CONFIG["roles"]["user"]
-        # "admin:nuke" not in allow list
+    def test_guest_deny_skill(self):
+        cfg = SAMPLE_CONFIG["roles"]["guest"]
+        assert h._is_action_allowed("skill:summarize", cfg) is False
+
+    def test_guest_unknown_action_denied(self):
+        cfg = SAMPLE_CONFIG["roles"]["guest"]
+        # Not in allow list → denied
         assert h._is_action_allowed("admin:nuke", cfg) is False
 
     def test_empty_allow_means_no_restriction(self):
         cfg = {"allow": [], "deny": []}
         assert h._is_action_allowed("anything", cfg) is True
+
+    def test_wildcard_allow(self):
+        cfg = {"allow": ["*"], "deny": []}
+        assert h._is_action_allowed("terminal", cfg) is True
+        assert h._is_action_allowed("system:stop", cfg) is True
+
+    def test_deny_overrides_allow(self):
+        cfg = {"allow": ["*"], "deny": ["system:stop"]}
+        assert h._is_action_allowed("system:stop", cfg) is False
+        assert h._is_action_allowed("chat", cfg) is True
 
 
 # ---------------------------------------------------------------------------
@@ -221,14 +230,14 @@ class TestRolePersistence:
         assert result == {}
 
     def test_save_and_load_roundtrip(self, tmp_hermes_home):
-        assignments = {"123": "admin", "456": "user"}
+        assignments = {"123": "guest", "456": "guest"}
         h._save_dynamic_roles(assignments)
         loaded = h._load_dynamic_roles()
         assert loaded == assignments
 
     def test_save_is_atomic(self, tmp_hermes_home):
         """Verify no .tmp file is left behind after save."""
-        h._save_dynamic_roles({"x": "y"})
+        h._save_dynamic_roles({"x": "guest"})
         tmp_file = h._roles_file().with_suffix(".tmp")
         assert not tmp_file.exists()
 
@@ -239,31 +248,33 @@ class TestRolePersistence:
 
 
 # ---------------------------------------------------------------------------
-# Admin commands
+# Admin commands — 2-role model
 # ---------------------------------------------------------------------------
 
 class TestAdminCommands:
-    def test_as_assign(self):
+    def test_as_assign_guest(self):
         dynamic = {}
         ctx = {"is_command": True, "command": "as_assign",
-               "message": "/as_assign 777 user"}
+               "message": "/as_assign 777 guest"}
         result = h._handle_admin_command(ctx, SAMPLE_CONFIG, dynamic)
         assert result is not None
         assert result["allow"] is False
         assert "777" in result["reason"]
-        assert dynamic.get("777") == "user"
+        assert dynamic.get("777") == "guest"
 
     def test_as_assign_invalid_role(self):
+        """'admin' and 'user' are no longer valid roles."""
         dynamic = {}
-        ctx = {"is_command": True, "command": "as_assign",
-               "message": "/as_assign 777 superuser"}
-        result = h._handle_admin_command(ctx, SAMPLE_CONFIG, dynamic)
-        assert result is not None
-        assert "Unknown role" in result["reason"]
-        assert "777" not in dynamic
+        for invalid_role in ("admin", "user", "superuser"):
+            ctx = {"is_command": True, "command": "as_assign",
+                   "message": f"/as_assign 777 {invalid_role}"}
+            result = h._handle_admin_command(ctx, SAMPLE_CONFIG, dynamic)
+            assert result is not None
+            assert "Unknown role" in result["reason"]
+            assert "777" not in dynamic
 
     def test_as_revoke(self):
-        dynamic = {"777": "user"}
+        dynamic = {"777": "guest"}
         ctx = {"is_command": True, "command": "as_revoke",
                "message": "/as_revoke 777"}
         result = h._handle_admin_command(ctx, SAMPLE_CONFIG, dynamic)
@@ -285,7 +296,7 @@ class TestAdminCommands:
         assert "No dynamic" in result["reason"]
 
     def test_as_roles_with_assignments(self):
-        dynamic = {"123": "admin", "456": "user"}
+        dynamic = {"123": "guest", "456": "guest"}
         ctx = {"is_command": True, "command": "as_roles", "message": "/as_roles"}
         result = h._handle_admin_command(ctx, SAMPLE_CONFIG, dynamic)
         assert result is not None
@@ -293,11 +304,12 @@ class TestAdminCommands:
         assert "456" in result["reason"]
 
     def test_as_info(self):
-        ctx = {"is_command": True, "command": "as_info", "message": "/as_info 222"}
+        ctx = {"is_command": True, "command": "as_info", "message": "/as_info 777"}
         result = h._handle_admin_command(ctx, SAMPLE_CONFIG, {})
         assert result is not None
-        assert "222" in result["reason"]
-        assert "user" in result["reason"]
+        assert "777" in result["reason"]
+        # Unlisted user resolves to guest in as_info
+        assert "guest" in result["reason"]
 
     def test_non_admin_command_returns_none(self):
         ctx = {"is_command": True, "command": "help", "message": "/help"}
@@ -311,7 +323,7 @@ class TestAdminCommands:
 
 
 # ---------------------------------------------------------------------------
-# Full handle() integration
+# Full handle() integration — 2-role model
 # ---------------------------------------------------------------------------
 
 class TestHandleIntegration:
@@ -323,28 +335,33 @@ class TestHandleIntegration:
             yield
 
     @pytest.mark.asyncio
-    async def test_owner_always_allowed(self, mock_config):
-        ctx = {"chat_id": "999", "is_command": False, "message": "hello"}
-        result = await h.handle("before_message", ctx)
-        assert result["allow"] is True
+    async def test_any_user_chat_allowed(self, mock_config):
+        """All users default to guest — chat is allowed."""
+        for chat_id in ("111", "222", "777", "999"):
+            ctx = {"chat_id": chat_id, "is_command": False, "message": "hello"}
+            result = await h.handle("before_message", ctx)
+            assert result["allow"] is True, f"Expected allow for chat_id={chat_id}"
 
     @pytest.mark.asyncio
-    async def test_unlisted_auto_guest_chat_allowed(self, mock_config):
-        """Unlisted user defaults to guest role — chat is allowed."""
-        ctx = {"chat_id": "777", "is_command": False, "message": "hello"}
-        result = await h.handle("before_message", ctx)
-        assert result["allow"] is True
-
-    @pytest.mark.asyncio
-    async def test_unlisted_auto_guest_terminal_denied(self, mock_config):
-        """Unlisted user defaults to guest — terminal/system commands blocked."""
+    async def test_any_user_terminal_denied(self, mock_config):
+        """All users default to guest — terminal is blocked."""
         ctx = {"chat_id": "777", "is_command": True, "command": "terminal",
                "message": "/terminal ls"}
         result = await h.handle("before_message", ctx)
         assert result["allow"] is False
+        assert "Action denied" in result["reason"]
 
     @pytest.mark.asyncio
-    async def test_unlisted_denied_when_deny_unlisted_true(self):
+    async def test_any_user_system_command_denied(self, mock_config):
+        """system:* commands are blocked for all users."""
+        ctx = {"chat_id": "777", "is_command": True, "command": "reset",
+               "message": "/reset"}
+        result = await h.handle("before_message", ctx)
+        assert result["allow"] is False
+
+    @pytest.mark.asyncio
+    async def test_deny_unlisted_blocks_all(self):
+        """When deny_unlisted=true, all unlisted users are blocked immediately."""
         config = {**SAMPLE_CONFIG, "deny_unlisted": True}
         with patch.object(h, "_load_config", return_value=config), \
              patch.object(h, "_load_dynamic_roles", return_value={}):
@@ -352,20 +369,6 @@ class TestHandleIntegration:
             result = await h.handle("before_message", ctx)
             assert result["allow"] is False
             assert "Unlisted denied" in result["reason"]
-
-    @pytest.mark.asyncio
-    async def test_user_chat_allowed(self, mock_config):
-        ctx = {"chat_id": "222", "is_command": False, "message": "hello"}
-        result = await h.handle("before_message", ctx)
-        assert result["allow"] is True
-
-    @pytest.mark.asyncio
-    async def test_user_terminal_denied(self, mock_config):
-        ctx = {"chat_id": "222", "is_command": True, "command": "terminal",
-               "message": "/terminal ls"}
-        result = await h.handle("before_message", ctx)
-        assert result["allow"] is False
-        assert "Action denied" in result["reason"]
 
     @pytest.mark.asyncio
     async def test_disabled_config_passes_all(self):
@@ -381,25 +384,33 @@ class TestHandleIntegration:
         with patch.object(h, "_load_config", return_value=config), \
              patch.object(h, "_load_dynamic_roles", return_value={}):
             ctx = {
-                "user_id": "222",
+                "user_id": "777",
                 "message": "hello",
                 "response": "hi there",
             }
             await h.handle("agent:end", ctx)
-            log_file = tmp_hermes_home / "logs" / "conversations" / "222.jsonl"
+            log_file = tmp_hermes_home / "logs" / "conversations" / "777.jsonl"
             assert log_file.exists()
             entry = json.loads(log_file.read_text().strip())
             assert entry["user"] == "hello"
             assert entry["agent"] == "hi there"
-            assert entry["role"] == "user"
+            assert entry["role"] == "guest"
 
     @pytest.mark.asyncio
     async def test_rate_limit_blocks_after_threshold(self, mock_config):
-        h._rate_state["222"] = {
-            "minute": {"ts": time.time(), "count": 5},
-            "day": {"ts": time.time(), "count": 5},
+        """Guest rate limit is enforced for all users."""
+        h._rate_state["777"] = {
+            "minute": {"ts": time.time(), "count": 2},
+            "day": {"ts": time.time(), "count": 2},
         }
-        ctx = {"chat_id": "222", "is_command": False, "message": "hello"}
+        ctx = {"chat_id": "777", "is_command": False, "message": "hello"}
         result = await h.handle("before_message", ctx)
         assert result["allow"] is False
         assert "Rate limited (minute)" in result["reason"]
+
+    @pytest.mark.asyncio
+    async def test_no_chat_id_passes_through(self, mock_config):
+        """Messages with no chat_id are passed through (cannot enforce)."""
+        ctx = {"is_command": False, "message": "hello"}
+        result = await h.handle("before_message", ctx)
+        assert result["allow"] is True

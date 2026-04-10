@@ -2,7 +2,7 @@
 
 **Role-based access control middleware for [Hermes Agent](https://github.com/NousResearch/hermes-agent)**
 
-AgentShield turns Hermes into a customer-facing agent — safe, rate-limited, and revenue-ready — without forking or modifying Hermes source code.
+AgentShield turns Hermes into a customer-facing AI employee — available 24/7, safe, and rate-limited — without forking or modifying Hermes source code.
 
 ```
 Customer sends message (Telegram/Discord/...)
@@ -22,13 +22,19 @@ AgentShield hook (agent:end)
 
 ---
 
+## Design Philosophy
+
+AgentShield operates on a simple principle: the agent serves customers, not the other way around. Customers get a helpful, rate-limited chat interface. The owner gets full control. The system protects itself by default — nothing dangerous is ever exposed to the public layer.
+
+---
+
 ## Features
 
-- **RBAC** — per-role allow/deny patterns (`chat`, `skill:*`, `command:*`)
+- **Auto-guest** — all external users automatically get the guest role. No whitelist needed.
 - **Rate limiting** — per-minute and per-day limits per role
+- **Action control** — allow/deny by action type (`chat`, `command:*`, `skill:*`, `system:*`)
 - **Action inference** — distinguishes `chat`, `command:x`, `skill:x`, `system:reset`, `system:stop`
-- **Auto-guest** — unknown users automatically fall into the `guest` role, no whitelist needed
-- **Persistent role assignments** — assign roles via `/as_assign`, survives gateway restarts
+- **Persistent role assignments** — assign roles at runtime via `/as_assign`, survives gateway restarts
 - **Conversation logging** — every turn logged to `~/.hermes/logs/conversations/<chat_id>.jsonl`
 - **Owner alerts** — Telegram notification when suspicious actions are blocked
 - **Zero-fork** — a single hook file, no changes to Hermes required
@@ -42,7 +48,7 @@ AgentShield is designed for the **customer-facing agent** model:
 ```
 Owner
   → Interacts with agent via CLI directly on the server
-  → Full tools, no restrictions
+  → Full tools, no restrictions (owner role planned — see Roadmap)
 
 Customers
   → Interact via Telegram / messaging platform
@@ -90,7 +96,6 @@ agentshield:
 
   roles:
     guest:
-      chat_ids: []
       allow: ["chat"]
       deny: ["command:*", "system:*", "terminal", "skill:*"]
       rate_limit:
@@ -138,18 +143,16 @@ journalctl --user -u hermes-gateway -n 20 | grep agentshield
 
 ## Full Configuration Reference
 
-See [`config/agentshield.yaml.example`](config/agentshield.yaml.example) for a full example with multiple roles.
+See [`config/agentshield.yaml.example`](config/agentshield.yaml.example) for a full annotated example.
 
 ### Role system
 
-| Role | Description |
-|------|-------------|
-| `owner` | Bypasses all checks, can use `/as_*` admin commands |
-| `admin` | Full access, high rate limits |
-| `user` | Chat + skills + safe commands |
-| `guest` | Chat only, low rate limits — default for unknown users |
+| Role | Status | Description |
+|------|--------|-------------|
+| `owner` | Planned | Bypasses all checks, can use `/as_*` admin commands. Set via `owner_chat_id` in config. |
+| `guest` | Active | Default for all users. Chat only, rate-limited. No dangerous actions allowed. |
 
-Unknown users automatically fall into `guest`. No whitelist configuration needed.
+All external users automatically fall into `guest`. No whitelist configuration needed.
 
 ### Action types
 
@@ -165,7 +168,7 @@ Unknown users automatically fall into `guest`. No whitelist configuration needed
 
 ## Management
 
-All management is done **directly on the server via CLI** — there are no admin commands over Telegram.
+All management is done **directly on the server via CLI**:
 
 ```bash
 # SSH into the server
@@ -181,13 +184,9 @@ cat ~/.hermes/logs/conversations/<chat_id>.jsonl
 # Restart gateway to apply config changes
 hermes gateway restart
 
-# View dynamic role assignments (set via future admin tooling)
+# View dynamic role assignments
 cat ~/.hermes/agentshield_roles.json
 ```
-
-> **Note:** Telegram-based admin commands (`/as_assign`, `/as_roles`, etc.) exist in the codebase
-> but are not active in the current deployment. Admin role management via Telegram is planned
-> for a future release. For now, all administration is CLI-only.
 
 ---
 
@@ -202,7 +201,7 @@ pytest tests/ -v
 
 ## Project Goal
 
-> Turn Hermes Agent into an **AI employee that can generate revenue** — handling customer inquiries, support, and consultation 24/7 — while keeping the underlying system completely secure.
+> Turn Hermes Agent into a real online customer care employee — available 24/7 to handle customer inquiries — while keeping the underlying system completely self-protected.
 
 AgentShield is the armor that lets the agent work in the real world without exposing the owner's infrastructure.
 
@@ -227,7 +226,7 @@ Pull requests and issues are welcome.
 > The goal is practical and learning-oriented — not production-perfect.
 >
 > There are likely gaps in security hardening, edge case handling, and code quality.
-> If you are a developer and see something worth improving, **issues and PRs are very welcome**.
+> If you are a developer and see something worth improving, **issues and PRs are very welcome**. 
 >
 > Let's build something that lets AI agents do real work — safely, reliably, and profitably.
 

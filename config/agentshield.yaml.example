@@ -1,27 +1,46 @@
 agentshield:
   enabled: true
 
-  # Không có owner qua Telegram — chủ nhân dùng CLI trực tiếp trên máy
-  # owner_chat_id: disabled
+  # TODO: owner role — uncomment and set your Telegram chat_id here when
+  # owner bypass is implemented. The owner will then be able to use /as_*
+  # admin commands directly from Telegram and bypass all access checks.
+  # For now, the owner interacts via CLI on the server, not via Telegram.
+  # owner_chat_id: "YOUR_TELEGRAM_CHAT_ID"
 
-  # Tất cả user qua Telegram đều là guest — không có phân biệt role
+  # false (default) — all unknown users fall into guest role automatically.
+  # true            — block all users not explicitly assigned a role.
   deny_unlisted: false
 
   roles:
+    # guest — the only active role. Every external user is a guest.
+    # Restrict what guests can do and how fast they can send messages.
     guest:
-      chat_ids: []
-      allow: ["chat"]
-      deny: ["command:*", "system:*", "terminal", "skill:*"]
+      chat_ids: []    # not used — all unlisted users are guest automatically
+      allow:
+        - "chat"       # regular text messages: allowed
+        # Add more action types here as needed:
+        # - "command:help"
+        # - "command:start"
+      deny:
+        - "command:*"  # all slash commands: blocked
+        - "system:*"   # /reset, /new, /stop, etc.: blocked
+        - "skill:*"    # skill invocations: blocked
+        - "terminal"   # terminal tool: blocked
       rate_limit:
         messages_per_minute: 10
         messages_per_day: 200
 
+  # TODO: owner role — when owner bypass is implemented, the owner will be
+  # able to receive alerts here even if owner_chat_id is set.
   alerts:
-    on_action_denied: false   # không có owner Telegram để nhận alert
-    on_rate_limit: false
+    on_action_denied: true    # notify owner when a blocked action is attempted
+    on_rate_limit: false      # notify owner on rate limit hits (usually noisy)
+
+  logging:
+    conversations: true   # log every turn to ~/.hermes/logs/conversations/
 
   messages:
     rate_limit_minute: "I'm handling a lot of messages right now — please try again in a moment 😊"
-    rate_limit_day: "You've reached today's message limit. Feel free to continue tomorrow, or contact our support team directly!"
-    action_denied: "That feature isn't available in this chat. Please contact our support team for further assistance 😊"
-    unlisted_denied: "Hello! This support channel is currently in beta. Please reach out through our official channels."
+    rate_limit_day: "You've reached today's message limit. Feel free to continue tomorrow!"
+    action_denied: "That feature isn't available in this chat. Please contact our support team 😊"
+    unlisted_denied: "Hello! This channel is currently in private beta. Please reach out through our official channels."

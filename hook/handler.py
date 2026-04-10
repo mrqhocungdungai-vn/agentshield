@@ -1,20 +1,23 @@
 """
-AgentShield — Hermes before_message hook  (v0.2.0)
+AgentShield — Hermes before_message hook  (v0.3.0)
 ====================================================
 Role-based access control middleware for Hermes Gateway.
 
+Two-role model
+--------------
+- guest  (active)  — all external/unknown users. Rate-limited, action-controlled,
+                     conversation-logged. This is the only enforced role.
+- owner  (planned) — reserved. See # TODO: owner role below.
+
 Features
 --------
-- Per-role allow / deny lists with wildcard patterns (fnmatch)
+- Auto-guest: all users fall into guest by default — no whitelist needed
 - Per-role rate limiting  (messages per minute + messages per day)
 - Action inference from message context (chat / command:x / skill:x / system:*)
+- Per-role allow/deny lists with wildcard patterns (fnmatch)
 - Persistent role assignments  →  ~/.hermes/agentshield_roles.json
 - Per-user conversation logging → ~/.hermes/logs/conversations/<chat_id>.jsonl
-- Owner /admin commands for runtime role management:
-    /as_assign <chat_id> <role>
-    /as_revoke <chat_id>
-    /as_roles
-    /as_info <chat_id>
+- Owner alerts via Telegram Bot API on action_denied / rate_limit events
 
 Config file: ~/.hermes/agentshield.yaml
 
@@ -23,44 +26,32 @@ Config format
 agentshield:
   enabled: true
 
-  # Owner chat_id — always bypasses all checks and can run /admin commands
-  owner_chat_id: "123456789"
+  # TODO: owner role — set owner_chat_id here when owner bypass is implemented.
+  # owner_chat_id: "123456789"
 
-  # If true, users NOT listed in any role get denied.
-  # If false (default), unlisted users pass through (Hermes owns the allowlist).
-  deny_unlisted: false
+  deny_unlisted: false   # false = everyone gets guest. true = block unknown users.
 
   roles:
-    admin:
-      chat_ids: ["111111111"]
-      allow: ["*"]
-      rate_limit:
-        messages_per_minute: 60
-        messages_per_day: 2000
-
-    user:
-      chat_ids: ["222222222"]
-      allow: ["chat", "skill:*", "command:help", "command:new", "command:reset"]
-      deny: ["terminal", "system:stop"]
+    guest:
+      chat_ids: []        # not used for guest (all unknown users → guest)
+      allow: ["chat"]
+      deny: ["command:*", "system:*", "terminal", "skill:*"]
       rate_limit:
         messages_per_minute: 10
         messages_per_day: 200
 
-    guest:
-      chat_ids: []
-      allow: ["chat"]
-      rate_limit:
-        messages_per_minute: 3
-        messages_per_day: 30
+  alerts:
+    on_action_denied: true
+    on_rate_limit: false
 
   logging:
     conversations: true   # log every turn to ~/.hermes/logs/conversations/
 
   messages:
-    rate_limit_minute: "⏳ You are sending messages too fast. Please wait a minute."
-    rate_limit_day: "📵 You have reached today's message limit. Please try again tomorrow."
-    action_denied: "🚫 You do not have permission to perform this action."
-    unlisted_denied: "❌ You do not have access to this agent."
+    rate_limit_minute: "I'm handling a lot of messages right now — please try again in a moment 😊"
+    rate_limit_day: "You've reached today's message limit. Feel free to continue tomorrow!"
+    action_denied: "That feature isn't available in this chat. Please contact our support team 😊"
+    unlisted_denied: "You do not have access to this agent."
 """
 
 from __future__ import annotations
@@ -264,7 +255,7 @@ def _infer_action(context: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Role resolution
+# Role resolution — 2-role model
 # ---------------------------------------------------------------------------
 
 def _find_role(
@@ -273,27 +264,36 @@ def _find_role(
     dynamic: Dict[str, str],
 ) -> Optional[str]:
     """
-    Resolve the role for a chat_id. Priority order:
-    1. Owner (from config)
-    2. Dynamic assignment (from agentshield_roles.json)
-    3. Static assignment (from config chat_ids)
-    4. None (unlisted)
+    Resolve the role for a chat_id.
+
+    Two-role model:
+      - "owner"  → reserved / planned (see TODO below)
+      - "guest"  → all other users (active, enforced)
+      - None     → unlisted (only when deny_unlisted=true)
+
+    Priority order:
+      1. Owner check (by config owner_chat_id)
+      2. Dynamic assignment (from agentshield_roles.json)
+      3. None (unlisted — caller falls back to guest unless deny_unlisted)
+
+    Note: static chat_ids per-role (admin/user) have been removed.
+    The only meaningful static assignment is owner_chat_id in config.
     """
+    # TODO: owner role — check owner_chat_id from config.
+    # When owner bypass is implemented, this block will short-circuit
+    # all further checks and return "owner" for the owner's chat_id.
+    # For now, owner is not identified — they interact via CLI, not Telegram.
     owner_id = str(config.get("owner_chat_id", ""))
     if owner_id and chat_id == owner_id:
-        return "owner"
+        # TODO: owner role — return "owner" and bypass all checks in handle().
+        # Temporarily falls through to guest treatment below.
+        pass
 
-    # Dynamic first (allows runtime promotion/demotion)
+    # Dynamic assignment (runtime /as_assign commands)
     if chat_id in dynamic:
         return dynamic[chat_id]
 
-    # Static from config
-    roles = config.get("roles", {})
-    for role_name, role_cfg in roles.items():
-        chat_ids: List[str] = [str(x) for x in (role_cfg.get("chat_ids") or [])]
-        if chat_id in chat_ids:
-            return role_name
-
+    # All other users are unlisted — caller decides guest vs deny
     return None
 
 
@@ -370,9 +370,12 @@ def _handle_admin_command(
 
     Commands:
       /as_assign <chat_id> <role>  — assign a role dynamically
-      /as_revoke <chat_id>         — remove dynamic assignment (fall back to config)
+      /as_revoke <chat_id>         — remove dynamic assignment
       /as_roles                    — list all dynamic assignments
       /as_info <chat_id>           — show role + rate state for a user
+
+    Valid roles in the 2-role model: guest only.
+    (owner is reserved but not assignable via /as_assign — it is a config-level concept.)
     """
     if not context.get("is_command"):
         return None
@@ -384,10 +387,11 @@ def _handle_admin_command(
     # Parse args from the raw message
     message = context.get("message", "")
     parts = message.strip().split()
-    # parts[0] is the command itself (e.g. "/as_assign")
     args = parts[1:]
 
-    valid_roles = set(config.get("roles", {}).keys()) | {"owner"}
+    # Valid assignable roles: only guest in the 2-role model.
+    # owner is intentionally excluded — it is set via config, not /as_assign.
+    valid_roles = set(config.get("roles", {}).keys())
 
     if cmd == "as_assign":
         if len(args) < 2:
@@ -427,20 +431,19 @@ def _handle_admin_command(
             reply = "Usage: /as_info <chat_id>"
         else:
             target_id = str(args[0])
-            role = _find_role(target_id, config, dynamic)
+            role = _find_role(target_id, config, dynamic) or "guest"
             rate_info = _rate_state.get(target_id, {})
             min_count = rate_info.get("minute", {}).get("count", 0)
             day_count = rate_info.get("day", {}).get("count", 0)
             reply = (
                 f"chat_id: {target_id}\n"
-                f"role: {role or 'unlisted'}\n"
+                f"role: {role}\n"
                 f"messages this minute: {min_count}\n"
                 f"messages today: {day_count}"
             )
     else:
         return None
 
-    # Block the message from reaching the agent, send the admin reply instead
     return {"allow": False, "reason": reply}
 
 
@@ -466,7 +469,7 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
         if config and config.get("enabled", True):
             chat_id = str(context.get("user_id") or context.get("chat_id") or "")
             dynamic = _load_dynamic_roles()
-            role = _find_role(chat_id, config, dynamic) or "unknown"
+            role = _find_role(chat_id, config, dynamic) or "guest"
             _log_conversation(
                 config,
                 chat_id,
@@ -491,32 +494,34 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
     role = _find_role(chat_id, config, dynamic)
     messages = config.get("messages", {})
 
-    # ── Owner: check for admin commands first, then always allow ──────────
-    if role == "owner":
-        admin_result = _handle_admin_command(context, config, dynamic)
-        if admin_result is not None:
-            return admin_result
-        _record_message(chat_id)
-        return {"allow": True}
+    # ── TODO: owner role ───────────────────────────────────────────────────
+    # When owner bypass is implemented:
+    #   if role == "owner":
+    #       admin_result = _handle_admin_command(context, config, dynamic)
+    #       if admin_result is not None:
+    #           return admin_result
+    #       _record_message(chat_id)
+    #       return {"allow": True}
+    #
+    # For now, owner_chat_id is not set in default config — the owner
+    # interacts via CLI on the server, not via Telegram.
+    # ──────────────────────────────────────────────────────────────────────
 
     # ── Unlisted user ──────────────────────────────────────────────────────
     if role is None:
         if config.get("deny_unlisted", False):
             reason = messages.get("unlisted_denied", "You don't have access to this agent.")
             return {"allow": False, "reason": reason}
-        # Auto-guest: apply guest role limits to unlisted users instead of
-        # passing through freely. This ensures every stranger is rate-limited
-        # and restricted to safe actions even without explicit assignment.
+        # All unlisted users fall into guest — the only active role.
         role = "guest"
 
-    # ── Known role — rate limit check ─────────────────────────────────────
+    # ── Guest role — rate limit check ─────────────────────────────────────
     role_cfg = config.get("roles", {}).get(role, {})
     rate_limits = role_cfg.get("rate_limit", {})
     if rate_limits:
         limit_key = _check_rate_limit(chat_id, rate_limits)
         if limit_key:
             reason = messages.get(limit_key, "Rate limit exceeded. Please try again later.")
-            # Alert owner nếu được bật trong config
             alerts = config.get("alerts", {})
             if alerts.get("on_rate_limit", False):
                 _notify_owner(config, limit_key, chat_id, f"role={role}")
@@ -526,7 +531,6 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
     action = _infer_action(context)
     if not _is_action_allowed(action, role_cfg):
         reason = messages.get("action_denied", "You don't have permission for that.")
-        # Luôn alert owner khi có người cố dùng lệnh bị chặn
         alerts = config.get("alerts", {})
         if alerts.get("on_action_denied", True):
             user_msg = context.get("message", "")[:80]

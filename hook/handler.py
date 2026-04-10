@@ -1,5 +1,5 @@
 """
-AgentShield — Hermes before_message hook  (v0.3.0)
+AgentShield — Hermes before_message hook  (v0.3.1)
 ====================================================
 Role-based access control middleware for Hermes Gateway.
 
@@ -12,12 +12,14 @@ Two-role model
 Features
 --------
 - Auto-guest: all users fall into guest by default — no whitelist needed
-- Per-role rate limiting  (messages per minute + messages per day)
+- Per-role rate limiting  (messages per minute + messages per day) — thread-safe
 - Action inference from message context (chat / command:x / skill:x / system:*)
 - Per-role allow/deny lists with wildcard patterns (fnmatch)
 - Persistent role assignments  →  ~/.hermes/agentshield_roles.json
 - Per-user conversation logging → ~/.hermes/logs/conversations/<chat_id>.jsonl
+  with soft size cap (LOG_MAX_BYTES per user, configurable via config.logging.max_bytes_per_user)
 - Owner alerts via Telegram Bot API on action_denied / rate_limit events
+- Unbounded _rate_state cleanup: entries not seen for >24h are evicted periodically
 
 Config file: ~/.hermes/agentshield.yaml
 
@@ -46,6 +48,7 @@ agentshield:
 
   logging:
     conversations: true   # log every turn to ~/.hermes/logs/conversations/
+    max_bytes_per_user: 10485760   # 10 MB per user log file (soft cap, oldest lines dropped)
 
   messages:
     rate_limit_minute: "I'm handling a lot of messages right now — please try again in a moment 😊"
@@ -59,6 +62,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import threading
 import time
 import urllib.request
 import urllib.parse
@@ -67,6 +71,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Default soft cap per user log file: 10 MB.
+# When exceeded, the oldest 20% of lines are dropped.
+_LOG_DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+
+# Evict _rate_state entries not seen for this many seconds (to prevent unbounded growth).
+_RATE_STATE_TTL = 86400 * 2  # 2 days
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +106,11 @@ def _conv_log_dir() -> Path:
 # ---------------------------------------------------------------------------
 
 def _load_config() -> Dict[str, Any]:
-    """Load agentshield.yaml from ~/.hermes/ or hook dir."""
+    """Load agentshield.yaml from ~/.hermes/ or hook dir.
+
+    Returns {} (empty dict) if no config file is found or the file is malformed.
+    Malformed config is logged; it does NOT crash the gateway.
+    """
     candidates = [
         _hermes_home() / "agentshield.yaml",
         Path(__file__).parent / "config.yaml",
@@ -138,9 +158,14 @@ def _save_dynamic_roles(assignments: Dict[str, str]) -> None:
 # ---------------------------------------------------------------------------
 
 def _send_telegram_alert(token: str, chat_id: str, text: str) -> None:
-    """Send a message to owner via Telegram Bot API (stdlib only, no httpx)."""
+    """Send a message to owner via Telegram Bot API (stdlib only, no httpx).
+
+    Failures are logged and swallowed — never blocks message processing.
+    Token comes from TELEGRAM_BOT_TOKEN env var, never from config or source code.
+    """
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        # nosec B310 — URL is always api.telegram.org; token comes from env var.
+        url = f"https://api.telegram.org/bot{token}/sendMessage"  # nosec B310
         payload = json.dumps({
             "chat_id": chat_id,
             "text": text,
@@ -148,13 +173,16 @@ def _send_telegram_alert(token: str, chat_id: str, text: str) -> None:
         }).encode("utf-8")
         req = urllib.request.Request(url, data=payload,
                                      headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=5)  # nosec B310
     except Exception as e:
         print(f"[agentshield] Telegram alert failed: {e}", flush=True)
 
 
 def _notify_owner(config: Dict[str, Any], event: str, chat_id: str, detail: str) -> None:
-    """Send security alert to owner if bot token is available."""
+    """Send security alert to owner if bot token is available.
+
+    TELEGRAM_BOT_TOKEN must be set as an environment variable — not in config.
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     owner_id = str(config.get("owner_chat_id", ""))
     if not token or not owner_id:
@@ -175,49 +203,78 @@ def _notify_owner(config: Dict[str, Any], event: str, chat_id: str, detail: str)
 
 
 # ---------------------------------------------------------------------------
-# Rate limiter (in-memory, per gateway process)
+# Rate limiter — thread-safe, with TTL eviction
 # ---------------------------------------------------------------------------
 
-# {chat_id: {"minute": {"ts": float, "count": int}, "day": {"ts": float, "count": int}}}
+# {chat_id: {"minute": {"ts": float, "count": int}, "day": {"ts": float, "count": int},
+#            "_last_seen": float}}
 _rate_state: Dict[str, Dict[str, Any]] = {}
+_rate_lock = threading.Lock()
+_last_eviction: float = 0.0
+
+
+def _evict_stale_rate_entries() -> None:
+    """Remove _rate_state entries not seen for _RATE_STATE_TTL seconds.
+
+    Called periodically inside _check_rate_limit to prevent unbounded dict growth
+    when many unique chat_ids accumulate over weeks of operation.
+    Eviction runs at most once per hour to avoid overhead.
+    """
+    global _last_eviction
+    now = time.time()
+    if now - _last_eviction < 3600:
+        return
+    _last_eviction = now
+    stale = [cid for cid, state in _rate_state.items()
+             if now - state.get("_last_seen", 0) > _RATE_STATE_TTL]
+    for cid in stale:
+        del _rate_state[cid]
+    if stale:
+        print(f"[agentshield] Evicted {len(stale)} stale rate-limit entries", flush=True)
 
 
 def _check_rate_limit(chat_id: str, limits: Dict[str, int]) -> Optional[str]:
-    """
-    Check rate limits. Returns None if OK, or a message key if exceeded.
+    """Check rate limits. Returns None if OK, or a message key if exceeded.
+
+    Thread-safe: all reads and writes to _rate_state are protected by _rate_lock.
     Does NOT increment counters — call _record_message() after allowing.
     """
     now = time.time()
-    state = _rate_state.setdefault(chat_id, {})
+    with _rate_lock:
+        _evict_stale_rate_entries()
+        state = _rate_state.setdefault(chat_id, {})
+        state["_last_seen"] = now
 
-    per_min = limits.get("messages_per_minute")
-    if per_min:
-        bucket = state.setdefault("minute", {"ts": now, "count": 0})
-        if now - bucket["ts"] > 60:
-            bucket["ts"] = now
-            bucket["count"] = 0
-        if bucket["count"] >= per_min:
-            return "rate_limit_minute"
+        per_min = limits.get("messages_per_minute")
+        if per_min:
+            bucket = state.setdefault("minute", {"ts": now, "count": 0})
+            if now - bucket["ts"] > 60:
+                bucket["ts"] = now
+                bucket["count"] = 0
+            if bucket["count"] >= per_min:
+                return "rate_limit_minute"
 
-    per_day = limits.get("messages_per_day")
-    if per_day:
-        bucket = state.setdefault("day", {"ts": now, "count": 0})
-        if now - bucket["ts"] > 86400:
-            bucket["ts"] = now
-            bucket["count"] = 0
-        if bucket["count"] >= per_day:
-            return "rate_limit_day"
+        per_day = limits.get("messages_per_day")
+        if per_day:
+            bucket = state.setdefault("day", {"ts": now, "count": 0})
+            if now - bucket["ts"] > 86400:
+                bucket["ts"] = now
+                bucket["count"] = 0
+            if bucket["count"] >= per_day:
+                return "rate_limit_day"
 
     return None
 
 
 def _record_message(chat_id: str) -> None:
-    """Increment rate counters after a message is allowed through."""
-    state = _rate_state.get(chat_id, {})
-    for bucket_name in ("minute", "day"):
-        bucket = state.get(bucket_name)
-        if bucket:
-            bucket["count"] += 1
+    """Increment rate counters after a message is allowed through. Thread-safe."""
+    with _rate_lock:
+        state = _rate_state.get(chat_id, {})
+        state["_last_seen"] = time.time()
+        for bucket_name in ("minute", "day"):
+            bucket = state.get(bucket_name)
+            if bucket:
+                bucket["count"] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -275,9 +332,6 @@ def _find_role(
       1. Owner check (by config owner_chat_id)
       2. Dynamic assignment (from agentshield_roles.json)
       3. None (unlisted — caller falls back to guest unless deny_unlisted)
-
-    Note: static chat_ids per-role (admin/user) have been removed.
-    The only meaningful static assignment is owner_chat_id in config.
     """
     # TODO: owner role — check owner_chat_id from config.
     # When owner bypass is implemented, this block will short-circuit
@@ -322,8 +376,33 @@ def _is_action_allowed(action: str, role_cfg: Dict[str, Any]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Conversation logging
+# Conversation logging — with soft size cap
 # ---------------------------------------------------------------------------
+
+def _rotate_log_if_needed(log_path: Path, max_bytes: int) -> None:
+    """Soft log rotation: if log_path exceeds max_bytes, drop the oldest 20% of lines.
+
+    Uses an in-place rewrite — no external logrotate dependency required.
+    If the rewrite fails for any reason, the original file is left intact.
+    """
+    try:
+        size = log_path.stat().st_size
+        if size <= max_bytes:
+            return
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        drop = max(1, len(lines) // 5)  # drop oldest 20%
+        kept = lines[drop:]
+        tmp = log_path.with_suffix(".tmp")
+        tmp.write_text("".join(kept), encoding="utf-8")
+        tmp.replace(log_path)
+        print(
+            f"[agentshield] Rotated log {log_path.name}: dropped {drop} lines "
+            f"({size // 1024} KB → {tmp.stat().st_size // 1024} KB)",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[agentshield] Log rotation failed for {log_path}: {e}", flush=True)
+
 
 def _log_conversation(
     config: Dict[str, Any],
@@ -339,6 +418,13 @@ def _log_conversation(
     try:
         log_dir = _conv_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{chat_id}.jsonl"
+
+        # Rotate before appending if the file is getting too large
+        if log_path.exists():
+            max_bytes = int(logging_cfg.get("max_bytes_per_user", _LOG_DEFAULT_MAX_BYTES))
+            _rotate_log_if_needed(log_path, max_bytes)
+
         entry = {
             "ts": datetime.utcnow().isoformat(),
             "chat_id": chat_id,
@@ -346,7 +432,7 @@ def _log_conversation(
             "user": user_msg,
             "agent": agent_reply,
         }
-        with open(log_dir / f"{chat_id}.jsonl", "a", encoding="utf-8") as f:
+        with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[agentshield] Conversation log failed: {e}", flush=True)
@@ -432,9 +518,10 @@ def _handle_admin_command(
         else:
             target_id = str(args[0])
             role = _find_role(target_id, config, dynamic) or "guest"
-            rate_info = _rate_state.get(target_id, {})
-            min_count = rate_info.get("minute", {}).get("count", 0)
-            day_count = rate_info.get("day", {}).get("count", 0)
+            with _rate_lock:
+                rate_info = _rate_state.get(target_id, {})
+                min_count = rate_info.get("minute", {}).get("count", 0)
+                day_count = rate_info.get("day", {}).get("count", 0)
             reply = (
                 f"chat_id: {target_id}\n"
                 f"role: {role}\n"
@@ -461,7 +548,19 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         {"allow": True}                     — message proceeds to agent
         {"allow": False, "reason": "..."}   — blocked, reason sent to user
+
+    This function NEVER raises. Any unexpected exception is caught, logged,
+    and treated as allow=True (fail-open) to prevent dropping customer messages.
     """
+    try:
+        return await _handle_inner(event_type, context)
+    except Exception as e:
+        print(f"[agentshield] Unexpected error in handle({event_type}): {e}", flush=True)
+        return {"allow": True}
+
+
+async def _handle_inner(event_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
+    """Inner handler — may raise; wrapped by handle() for safety."""
 
     # ── agent:end → log conversation ──────────────────────────────────────
     if event_type == "agent:end":

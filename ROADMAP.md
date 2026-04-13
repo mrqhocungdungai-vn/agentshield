@@ -1,89 +1,71 @@
 # AgentShield Roadmap
 
-## Phase 1 — Gateway Proxy ⚡ (Current Focus)
+AgentShield has one job: be a reliable, minimal security hook for customer-facing Hermes agents.
 
-**Goal:** Working access control in days. Deployable by any Hermes agent owner.
+This roadmap reflects that focus. Features outside this scope are explicitly listed at the bottom.
 
-### Core Features
-- [ ] Telegram bot gateway layer
-- [ ] Role system: `owner`, `admin`, `user`, `guest`
-- [ ] Command allowlist/denylist per role
-- [ ] Per-user rate limiting
-- [ ] Config file (YAML) for defining roles and permissions
-- [ ] Logging of all user interactions
-- [ ] Simple web dashboard (optional, stretch goal)
+---
+
+## Phase 1 — Stable Gateway Hook (current)
+
+**Goal:** Rock-solid rate limiting, action blocking, and conversation logging for the guest role. Clear install process. Well-tested. Zero footprint on Hermes internals.
+
+### Features
+- [x] Rate limiting per user (messages per minute + messages per day)
+- [x] Action inference and allow/deny by action type
+- [x] Auto-guest — all external users are guest by default, no whitelist required
+- [x] Prompt injection guard (case-insensitive pattern matching)
+- [x] Human escalation detection with owner alert
+- [x] Conversation logging to `~/.hermes/logs/conversations/<chat_id>.jsonl` with soft rotation
+- [x] Owner Telegram alerts on blocked actions
+- [x] Thread-safe rate limiter with TTL eviction
+- [x] Atomic config and role file writes
+- [x] Zero-fork install via single hook file
 
 ### Success Criteria
-- A Hermes customer-service agent can be deployed on Telegram
-- Public users can only use approved commands
-- Owner retains full control
-- Zero code changes needed to the underlying agent
+- Any Hermes owner can deploy a customer-facing Telegram agent safely in under 30 minutes
+- Single YAML config file, no code changes required
+- Full test coverage for hook logic (target: >= 90%)
+- No exception in the hook can crash the Hermes gateway
 
 ---
 
-## Phase 2 — Docker Sandbox Isolation 🐳
+## Phase 2 — Hardening and Observability
 
-**Goal:** True per-user isolation. Each user gets a full clone of the agent.
+**Goal:** Make the hook production-grade for real deployments handling sustained traffic.
 
-### Core Features
-- [ ] Docker Compose orchestration for agent containers
-- [ ] Per-user container lifecycle (create on first login, destroy on cancel)
-- [ ] Volume management for user state persistence
-- [ ] Resource limits (CPU, RAM, disk per container)
-- [ ] Container health monitoring
-- [ ] Auto-cleanup of idle containers
+### Features
+- [ ] Structured JSON log format (replace print statements with structured output)
+- [ ] Metrics output — blocked requests, rate limit hits, escalation count (stdout or file, no external dependency)
+- [ ] Graceful config reload without gateway restart (detect config file changes via mtime)
+- [ ] Improved owner alert formatting — include user message excerpt and action type in a consistent template
+- [ ] Config validation on startup — surface YAML errors and missing fields before the first message arrives
 
 ### Success Criteria
-- User can delete files inside their container — owner agent untouched
-- 100 concurrent users, each in their own sandbox
-- Container boot time < 10 seconds
+- A blocked action produces a log line parseable by standard log aggregators (jq, grep, etc.)
+- Config errors are reported clearly at startup, not silently at runtime
+- Metrics output is human-readable from `tail -f` and machine-parseable
 
 ---
 
-## Phase 3 — CRM Integration (Twenty) 📊
+## Phase 3 — Packaging
 
-**Goal:** Know your users. Build relationships. Manage your pipeline.
+**Goal:** Make AgentShield installable as a proper, versioned package compatible with the Hermes hook registry.
 
-### Core Features
-- [ ] Twenty CRM deployment (Docker)
-- [ ] Auto-create contact on first user message
-- [ ] Log conversation summaries to Twenty
-- [ ] User tier tracking (free, paid, enterprise)
-- [ ] Deal pipeline for upgrades
-- [ ] Webhook from gateway → Twenty
+### Features
+- [ ] pip-installable package (`pip install agentshield`)
+- [ ] Hermes hook registry compatibility (standard manifest format)
+- [ ] Versioned releases with changelog
+- [ ] Install command: `agentshield install` copies hook files and creates default config
 
----
-
-## Phase 4 — Automated Billing 💳
-
-**Goal:** Revenue on autopilot.
-
-### Core Features
-- [ ] Stripe integration
-- [ ] Usage-based billing (per message / per task)
-- [ ] Subscription tiers
-- [ ] Auto-suspend container on payment failure
-- [ ] Invoice PDF generation
-- [ ] Crypto payment option (USDT/ETH)
+### Success Criteria
+- Installation reduces to two commands: `pip install agentshield && agentshield install`
+- Each release has a changelog entry with breaking changes clearly marked
 
 ---
 
-## Phase 5 — Marketplace SDK 🌐
+## Out of Scope
 
-**Goal:** Package once, sell everywhere.
+Features like Docker sandbox isolation, CRM integration, billing, and marketplace infrastructure are intentionally out of scope for AgentShield. These belong to a separate infrastructure layer.
 
-### Core Features
-- [ ] Agent packaging format (manifest.yaml)
-- [ ] One-click publish to openknowledgemarket.com
-- [ ] Version management
-- [ ] Revenue sharing smart contract
-- [ ] Agent discovery API
-
----
-
-## Beyond
-
-- Multi-agent orchestration (owner delegates subtasks to specialized agents)
-- Agent-to-agent communication protocol
-- Federated agent marketplace (no central authority)
-- Mobile app for managing your agent fleet
+If you are interested in that direction, see [openknowledgemarket.com](https://openknowledgemarket.com).

@@ -1,859 +1,218 @@
 """
-AgentShield — Hermes before_message hook  (v0.4.0)
-====================================================
-Role-based access control middleware for Hermes Gateway.
+AgentShield — Hermes before_message hook (v1.0.0)
+==================================================
+Security middleware for customer-facing Hermes agents.
+Philosophy: ONE role. Maximum security. Every user is a guest.
 
-Two-role model
---------------
-- guest  (active)  — all external/unknown users. Rate-limited, action-controlled,
-                     conversation-logged. This is the only enforced role.
-- owner  (planned) — reserved. See # TODO: owner role below.
+Flow:
+  User message
+      → Load config
+      → Check rate limit  →  exceeded  →  reply + stop
+      → Check allow/deny  →  denied    →  reply + stop
+      → Pass to agent
+      → Log conversation turn (agent:end)
 
-Features
---------
-- Auto-guest: all users fall into guest by default — no whitelist needed
-- Per-role rate limiting  (messages per minute + messages per day) — thread-safe
-  * MRQ-30: top-level rate_limiting block with default_limit/window_seconds fallback
-- Action inference from message context (chat / command:x / skill:x / system:*)
-- Per-role allow/deny lists with wildcard patterns (fnmatch)
-- Persistent role assignments  →  ~/.hermes/agentshield_roles.json
-- Per-user conversation logging → ~/.hermes/logs/conversations/<chat_id>.jsonl
-  with soft size cap (LOG_MAX_BYTES per user, configurable via config.logging.max_bytes_per_user)
-- Owner alerts via Telegram Bot API on action_denied / rate_limit / escalation events
-- Unbounded _rate_state cleanup: entries not seen for >24h are evicted periodically
-- MRQ-31: Per-role toolset control via RBAC (toolsets field in role config)
-- MRQ-32: Prompt injection guard (case-insensitive pattern matching)
-- MRQ-33: Human escalation detection with owner alert
-
-Config file: ~/.hermes/agentshield.yaml
-
-Config format
--------------
-agentshield:
-  enabled: true
-
-  # TODO: owner role — set owner_chat_id here when owner bypass is implemented.
-  # owner_chat_id: "123456789"
-
-  deny_unlisted: false   # false = everyone gets guest. true = block unknown users.
-
-  # MRQ-30: top-level rate limiting defaults (fallback when role has no rate_limit)
-  rate_limiting:
-    enabled: true
-    default_limit: 20        # messages per minute (fallback)
-    window_seconds: 60
-    roles:
-      admin: 0               # 0 = unlimited
-
-  roles:
-    guest:
-      chat_ids: []        # not used for guest (all unknown users → guest)
-      allow: ["chat"]
-      deny: ["command:*", "system:*", "terminal", "skill:*"]
-      rate_limit:
-        messages_per_minute: 10
-        messages_per_day: 200
-      toolsets: []        # MRQ-31: empty = no tools beyond base chat
-
-  alerts:
-    on_action_denied: true
-    on_rate_limit: false
-
-  logging:
-    conversations: true   # log every turn to ~/.hermes/logs/conversations/
-    max_bytes_per_user: 10485760   # 10 MB per user log file (soft cap, oldest lines dropped)
-
-  messages:
-    rate_limit_minute: "I'm handling a lot of messages right now — please try again in a moment 😊"
-    rate_limit_day: "You've reached today's message limit. Feel free to continue tomorrow!"
-    action_denied: "That feature isn't available in this chat. Please contact our support team 😊"
-    unlisted_denied: "You do not have access to this agent."
-
-  # MRQ-32: Prompt injection guard
-  injection_guard:
-    enabled: true
-    patterns:
-      - "ignore all previous instructions"
-      - "you are now"
-      - "act as"
-      - "repeat your system prompt"
-      - "jailbreak"
-      - "DAN mode"
-      - "ignore previous"
-      - "disregard your instructions"
-    block_message: "Tin nhắn của bạn không được xử lý."
-
-  # MRQ-33: Human escalation
-  escalation:
-    enabled: true
-    message: "Đang kết nối nhân viên hỗ trợ, vui lòng chờ trong giây lát..."
-    keywords:
-      - "nói chuyện với người"
-      - "muốn gặp nhân viên"
-      - "/human"
-      - "speak to human"
-      - "talk to human"
-      - "human agent"
-      - "gặp nhân viên"
-      - "chuyển cho người"
+Config: ~/.hermes/agentshield.yaml
 """
 
 from __future__ import annotations
 
-import fnmatch
-import hashlib
-import json
-import os
-import threading
-import time
-import urllib.request
-import urllib.parse
+import fnmatch, json, os, threading, time, urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-# Default soft cap per user log file: 10 MB.
-# When exceeded, the oldest 20% of lines are dropped.
-_LOG_DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
-
-# Evict _rate_state entries not seen for this many seconds (to prevent unbounded growth).
-_RATE_STATE_TTL = 86400 * 2  # 2 days
-
-# Default injection guard patterns (MRQ-32)
-_DEFAULT_INJECTION_PATTERNS = [
-    "ignore all previous instructions",
-    "you are now",
-    "act as",
-    "repeat your system prompt",
-    "jailbreak",
-    "DAN mode",
-    "ignore previous",
-    "disregard your instructions",
-]
-
-# Default human escalation keywords (MRQ-33)
-_DEFAULT_ESCALATION_KEYWORDS = [
-    "nói chuyện với người",
-    "muốn gặp nhân viên",
-    "/human",
-    "speak to human",
-    "talk to human",
-    "human agent",
-    "gặp nhân viên",
-    "chuyển cho người",
-]
+_LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB soft cap
+_RATE_TTL = 86400 * 2              # Evict entries not seen for 2 days
 
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
+# ── Paths ────────────────────────────────────────────────────────────────────
 
-def _hermes_home() -> Path:
+def _home() -> Path:
     return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
 
 
-def _roles_file() -> Path:
-    return _hermes_home() / "agentshield_roles.json"
-
-
-def _conv_log_dir() -> Path:
-    return _hermes_home() / "logs" / "conversations"
-
-
-# ---------------------------------------------------------------------------
-# Config loading
-# ---------------------------------------------------------------------------
+# ── Config ───────────────────────────────────────────────────────────────────
 
 def _load_config() -> Dict[str, Any]:
-    """Load agentshield.yaml from ~/.hermes/ or hook dir.
-
-    Returns {} (empty dict) if no config file is found or the file is malformed.
-    Malformed config is logged; it does NOT crash the gateway.
-    """
-    candidates = [
-        _hermes_home() / "agentshield.yaml",
-        Path(__file__).parent / "config.yaml",
-    ]
-    for path in candidates:
+    for path in [_home() / "agentshield.yaml", Path(__file__).parent / "config.yaml"]:
         if path.exists():
             try:
                 data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
                 return data.get("agentshield", data)
             except Exception as e:
-                print(f"[agentshield] Failed to load config {path}: {e}", flush=True)
+                print(f"[agentshield] Config load error {path}: {e}", flush=True)
     return {}
 
 
-# ---------------------------------------------------------------------------
-# Role persistence
-# ---------------------------------------------------------------------------
-
-def _load_dynamic_roles() -> Dict[str, str]:
-    """Load dynamically-assigned roles from disk. Returns {chat_id: role_name}."""
-    path = _roles_file()
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"[agentshield] Failed to load role assignments: {e}", flush=True)
-        return {}
-
-
-def _save_dynamic_roles(assignments: Dict[str, str]) -> None:
-    """Persist role assignments to disk atomically."""
-    path = _roles_file()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(assignments, indent=2), encoding="utf-8")
-        tmp.replace(path)
-    except Exception as e:
-        print(f"[agentshield] Failed to save role assignments: {e}", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Telegram alert helper
-# ---------------------------------------------------------------------------
-
-def _send_telegram_alert(token: str, chat_id: str, text: str) -> None:
-    """Send a message to owner via Telegram Bot API (stdlib only, no httpx).
-
-    Failures are logged and swallowed — never blocks message processing.
-    Token comes from TELEGRAM_BOT_TOKEN env var, never from config or source code.
-    """
-    try:
-        # nosec B310 — URL is always api.telegram.org; token comes from env var.
-        url = f"https://api.telegram.org/bot{token}/sendMessage"  # nosec B310
-        payload = json.dumps({
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-        }).encode("utf-8")
-        req = urllib.request.Request(url, data=payload,
-                                     headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=5)  # nosec B310
-    except Exception as e:
-        print(f"[agentshield] Telegram alert failed: {e}", flush=True)
-
+# ── Owner alert ──────────────────────────────────────────────────────────────
 
 def _notify_owner(config: Dict[str, Any], event: str, chat_id: str, detail: str) -> None:
-    """Send security alert to owner if bot token is available.
-
-    TELEGRAM_BOT_TOKEN must be set as an environment variable — not in config.
-    """
+    """Send alert to owner via Telegram Bot API. Token from env var only — never config."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     owner_id = str(config.get("owner_chat_id", ""))
     if not token or not owner_id:
         return
-    emoji_map = {
-        "action_denied": "🚫",
-        "rate_limit_minute": "⏳",
-        "rate_limit_day": "📵",
-        "escalation": "🆘",
-    }
-    emoji = emoji_map.get(event, "⚠️")
-    text = (
-        f"{emoji} <b>AgentShield Alert</b>\n"
-        f"Event: <code>{event}</code>\n"
-        f"User: <code>{chat_id}</code>\n"
-        f"Detail: {detail}"
-    )
-    _send_telegram_alert(token, owner_id, text)
+    emoji = {"action_denied": "🚫", "rate_limit_minute": "⏳", "rate_limit_day": "📵"}.get(event, "⚠️")
+    text = f"{emoji} <b>AgentShield Alert</b>\nEvent: <code>{event}</code>\nUser: <code>{chat_id}</code>\n{detail}"
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"  # nosec B310
+        payload = json.dumps({"chat_id": owner_id, "text": text, "parse_mode": "HTML"}).encode()
+        urllib.request.urlopen(  # nosec B310
+            urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}),
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[agentshield] Alert failed: {e}", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Rate limiter — thread-safe, with TTL eviction
-# ---------------------------------------------------------------------------
+# ── Rate limiter — thread-safe with TTL eviction ─────────────────────────────
 
-# {chat_id: {"minute": {"ts": float, "count": int}, "day": {"ts": float, "count": int},
-#            "_last_seen": float}}
 _rate_state: Dict[str, Dict[str, Any]] = {}
 _rate_lock = threading.Lock()
-_last_eviction: float = 0.0
+_last_evict: float = 0.0
 
 
-def _evict_stale_rate_entries() -> None:
-    """Remove _rate_state entries not seen for _RATE_STATE_TTL seconds.
-
-    Called periodically inside _check_rate_limit to prevent unbounded dict growth
-    when many unique chat_ids accumulate over weeks of operation.
-    Eviction runs at most once per hour to avoid overhead.
-    """
-    global _last_eviction
-    now = time.time()
-    if now - _last_eviction < 3600:
+def _evict_stale(now: float) -> None:
+    global _last_evict
+    if now - _last_evict < 3600:
         return
-    _last_eviction = now
-    stale = [cid for cid, state in _rate_state.items()
-             if now - state.get("_last_seen", 0) > _RATE_STATE_TTL]
-    for cid in stale:
-        del _rate_state[cid]
+    _last_evict = now
+    stale = [k for k, v in _rate_state.items() if now - v.get("_seen", 0) > _RATE_TTL]
+    for k in stale:
+        del _rate_state[k]
     if stale:
-        print(f"[agentshield] Evicted {len(stale)} stale rate-limit entries", flush=True)
+        print(f"[agentshield] Evicted {len(stale)} stale rate entries", flush=True)
 
 
-def _check_rate_limit(chat_id: str, limits: Dict[str, int], config: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Check rate limits. Returns None if OK, or a message key if exceeded.
-
-    Thread-safe: all reads and writes to _rate_state are protected by _rate_lock.
-    Does NOT increment counters — call _record_message() after allowing.
-
-    MRQ-30: Falls back to top-level rate_limiting.default_limit if limits is empty.
-    A role with value 0 in rate_limiting.roles means unlimited (no rate limit).
-    """
-    # MRQ-30: apply top-level defaults if limits dict is empty
-    effective_limits = dict(limits)
-    if not effective_limits and config is not None:
-        rl_cfg = config.get("rate_limiting", {})
-        if rl_cfg.get("enabled", True):
-            default_limit = rl_cfg.get("default_limit", 20)
-            window_seconds = rl_cfg.get("window_seconds", 60)
-            if default_limit:
-                effective_limits = {
-                    "messages_per_minute": default_limit,
-                    "_window_seconds": window_seconds,
-                }
-
+def _check_rate(chat_id: str, limits: Dict[str, int]) -> Optional[str]:
+    """Returns None if OK, or a message key if exceeded."""
     now = time.time()
     with _rate_lock:
-        _evict_stale_rate_entries()
-        state = _rate_state.setdefault(chat_id, {})
-        state["_last_seen"] = now
-
-        per_min = effective_limits.get("messages_per_minute")
-        if per_min:
-            window = effective_limits.get("_window_seconds", 60)
-            bucket = state.setdefault("minute", {"ts": now, "count": 0})
-            if now - bucket["ts"] > window:
-                bucket["ts"] = now
-                bucket["count"] = 0
-            if bucket["count"] >= per_min:
+        _evict_stale(now)
+        s = _rate_state.setdefault(chat_id, {"_seen": now})
+        s["_seen"] = now
+        if (n := limits.get("messages_per_minute")):
+            b = s.setdefault("min", {"ts": now, "count": 0})
+            if now - b["ts"] > 60:
+                b.update({"ts": now, "count": 0})
+            if b["count"] >= n:
                 return "rate_limit_minute"
-
-        per_day = effective_limits.get("messages_per_day")
-        if per_day:
-            bucket = state.setdefault("day", {"ts": now, "count": 0})
-            if now - bucket["ts"] > 86400:
-                bucket["ts"] = now
-                bucket["count"] = 0
-            if bucket["count"] >= per_day:
+        if (n := limits.get("messages_per_day")):
+            b = s.setdefault("day", {"ts": now, "count": 0})
+            if now - b["ts"] > 86400:
+                b.update({"ts": now, "count": 0})
+            if b["count"] >= n:
                 return "rate_limit_day"
-
     return None
 
 
-def _record_message(chat_id: str) -> None:
-    """Increment rate counters after a message is allowed through. Thread-safe."""
+def _record(chat_id: str) -> None:
+    """Increment counters after a message passes all checks."""
     with _rate_lock:
-        state = _rate_state.get(chat_id, {})
-        state["_last_seen"] = time.time()
-        for bucket_name in ("minute", "day"):
-            bucket = state.get(bucket_name)
-            if bucket:
-                bucket["count"] += 1
+        s = _rate_state.get(chat_id, {})
+        s["_seen"] = time.time()
+        for name in ("min", "day"):
+            if (b := s.get(name)):
+                b["count"] += 1
 
 
-# ---------------------------------------------------------------------------
-# Action inference
-# ---------------------------------------------------------------------------
+# ── Action inference ─────────────────────────────────────────────────────────
 
-def _infer_action(context: Dict[str, Any]) -> str:
-    """
-    Infer the AgentShield action name from message context.
-
-    Conventions:
-      "chat"           — regular text message
-      "command:<name>" — slash command  (/help → "command:help")
-      "skill:<name>"   — /skill run <name> invocation
-      "system:reset"   — /reset, /new, /clear
-      "system:stop"    — /stop, /cancel
-      "terminal"       — reserved for future shell-command detection
-    """
-    if not context.get("is_command"):
+def _infer_action(ctx: Dict[str, Any]) -> str:
+    if not ctx.get("is_command"):
         return "chat"
-
-    cmd = (context.get("command") or "").lower().strip()
-
+    cmd = (ctx.get("command") or "").lower().strip()
     if cmd in {"reset", "new", "clear"}:
         return "system:reset"
     if cmd in {"stop", "cancel"}:
         return "system:stop"
     if cmd == "skill":
-        message = context.get("message", "")
-        parts = message.strip().lstrip("/").split()
-        skill_name = parts[2] if len(parts) > 2 else "*"
-        return f"skill:{skill_name}"
-
+        parts = ctx.get("message", "").strip().lstrip("/").split()
+        return f"skill:{parts[2] if len(parts) > 2 else '*'}"
     return f"command:{cmd}"
 
 
-# ---------------------------------------------------------------------------
-# Role resolution — 2-role model
-# ---------------------------------------------------------------------------
+# ── Permission check ─────────────────────────────────────────────────────────
 
-def _find_role(
-    chat_id: str,
-    config: Dict[str, Any],
-    dynamic: Dict[str, str],
-) -> Optional[str]:
-    """
-    Resolve the role for a chat_id.
-
-    Two-role model:
-      - "owner"  → reserved / planned (see TODO below)
-      - "guest"  → all other users (active, enforced)
-      - None     → unlisted (only when deny_unlisted=true)
-
-    Priority order:
-      1. Owner check (by config owner_chat_id)
-      2. Dynamic assignment (from agentshield_roles.json)
-      3. None (unlisted — caller falls back to guest unless deny_unlisted)
-    """
-    # TODO: owner role — check owner_chat_id from config.
-    # When owner bypass is implemented, this block will short-circuit
-    # all further checks and return "owner" for the owner's chat_id.
-    # For now, owner is not identified — they interact via CLI, not Telegram.
-    owner_id = str(config.get("owner_chat_id", ""))
-    if owner_id and chat_id == owner_id:
-        # TODO: owner role — return "owner" and bypass all checks in handle().
-        # Temporarily falls through to guest treatment below.
-        pass
-
-    # Dynamic assignment (runtime /as_assign commands)
-    if chat_id in dynamic:
-        return dynamic[chat_id]
-
-    # All other users are unlisted — caller decides guest vs deny
-    return None
+def _allowed(action: str, cfg: Dict[str, Any]) -> bool:
+    """Deny-overrides-allow. Empty allow list = no restrictions."""
+    allow: List[str] = cfg.get("allow", [])
+    deny: List[str] = cfg.get("deny", [])
+    if any(fnmatch.fnmatch(action, p) for p in deny):
+        return False
+    if any(fnmatch.fnmatch(action, p) for p in allow):
+        return True
+    return len(allow) == 0
 
 
-# ---------------------------------------------------------------------------
-# Permission check
-# ---------------------------------------------------------------------------
+# ── Conversation logging ─────────────────────────────────────────────────────
 
-def _is_action_allowed(action: str, role_cfg: Dict[str, Any]) -> bool:
-    """
-    Check if action is allowed by role's allow/deny lists.
-    Logic: deny overrides allow. Default-deny if allow list is non-empty.
-    """
-    allow_patterns: List[str] = role_cfg.get("allow", [])
-    deny_patterns: List[str] = role_cfg.get("deny", [])
-
-    for pattern in deny_patterns:
-        if fnmatch.fnmatch(action, pattern):
-            return False
-
-    for pattern in allow_patterns:
-        if fnmatch.fnmatch(action, pattern):
-            return True
-
-    # Empty allow list = no restrictions defined = allow
-    return len(allow_patterns) == 0
-
-
-# ---------------------------------------------------------------------------
-# MRQ-31: Per-role toolset resolution via RBAC
-# ---------------------------------------------------------------------------
-
-def _get_role_toolsets(role_name: str, role_cfg: Dict[str, Any]) -> List[str]:
-    """Return the toolsets list for a role, defaulting to [] if not specified.
-
-    MRQ-31: toolsets field in role config controls which tool sets the agent
-    may use for that role. An empty list means no tools beyond base chat.
-    """
-    return list(role_cfg.get("toolsets", []))
-
-
-# ---------------------------------------------------------------------------
-# MRQ-32: Prompt injection guard
-# ---------------------------------------------------------------------------
-
-def _check_prompt_injection(
-    message: str,
-    chat_id: str,
-    config: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    """Detect prompt injection attempts. Returns block response dict or None.
-
-    Uses case-insensitive substring matching against configurable pattern list.
-    Logs user_id + SHA-256 hash of message (never the full message content).
-
-    Returns:
-        None if the message is safe.
-        {"allow": False, "reason": "..."} if injection detected.
-    """
-    try:
-        guard_cfg = config.get("injection_guard", {})
-        if not guard_cfg.get("enabled", True):
-            return None
-
-        patterns = guard_cfg.get("patterns", _DEFAULT_INJECTION_PATTERNS)
-        msg_lower = message.lower()
-
-        for pattern in patterns:
-            if pattern.lower() in msg_lower:
-                # Log hash of message, NOT the full message
-                hash_val = hashlib.sha256(message.encode("utf-8")).hexdigest()[:16]
-                print(
-                    f"[agentshield] Injection attempt from {chat_id}: hash={hash_val}",
-                    flush=True,
-                )
-                block_msg = guard_cfg.get(
-                    "block_message",
-                    "Tin nhắn của bạn không được xử lý.",
-                )
-                return {"allow": False, "reason": block_msg}
-
-        return None
-    except Exception as e:
-        print(f"[agentshield] Injection guard error: {e}", flush=True)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# MRQ-33: Human escalation detection
-# ---------------------------------------------------------------------------
-
-def _check_human_escalation(
-    message: str,
-    chat_id: str,
-    config: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    """Detect human escalation requests. Returns block response dict or None.
-
-    On keyword match:
-    1. Returns {"allow": False, "reason": escalation_message}
-    2. Notifies owner via Telegram with escalation alert
-
-    Returns:
-        None if no escalation keyword found.
-        {"allow": False, "reason": "..."} if escalation detected.
-    """
-    try:
-        esc_cfg = config.get("escalation", {})
-        if not esc_cfg.get("enabled", True):
-            return None
-
-        keywords = esc_cfg.get("keywords", _DEFAULT_ESCALATION_KEYWORDS)
-        msg_lower = message.lower()
-
-        for keyword in keywords:
-            if keyword.lower() in msg_lower:
-                escalation_msg = esc_cfg.get(
-                    "message",
-                    "Đang kết nối nhân viên hỗ trợ, vui lòng chờ trong giây lát...",
-                )
-                # Notify owner
-                detail = f"[ESCALATION] User {chat_id} cần hỗ trợ từ người. Keyword: {keyword}"
-                _notify_owner(config, "escalation", chat_id, detail)
-                return {"allow": False, "reason": escalation_msg}
-
-        return None
-    except Exception as e:
-        print(f"[agentshield] Escalation check error: {e}", flush=True)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Conversation logging — with soft size cap
-# ---------------------------------------------------------------------------
-
-def _rotate_log_if_needed(log_path: Path, max_bytes: int) -> None:
-    """Soft log rotation: if log_path exceeds max_bytes, drop the oldest 20% of lines.
-
-    Uses an in-place rewrite — no external logrotate dependency required.
-    If the rewrite fails for any reason, the original file is left intact.
-    """
-    try:
-        size = log_path.stat().st_size
-        if size <= max_bytes:
-            return
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-        drop = max(1, len(lines) // 5)  # drop oldest 20%
-        kept = lines[drop:]
-        tmp = log_path.with_suffix(".tmp")
-        tmp.write_text("".join(kept), encoding="utf-8")
-        tmp.replace(log_path)
-        print(
-            f"[agentshield] Rotated log {log_path.name}: dropped {drop} lines "
-            f"({size // 1024} KB → {tmp.stat().st_size // 1024} KB)",
-            flush=True,
-        )
-    except Exception as e:
-        print(f"[agentshield] Log rotation failed for {log_path}: {e}", flush=True)
-
-
-def _log_conversation(
-    config: Dict[str, Any],
-    chat_id: str,
-    role: str,
-    user_msg: str,
-    agent_reply: str,
-) -> None:
-    """Append one conversation turn to ~/.hermes/logs/conversations/<chat_id>.jsonl"""
-    logging_cfg = config.get("logging", {})
-    if not logging_cfg.get("conversations", True):
+def _log(config: Dict[str, Any], chat_id: str, user_msg: str, reply: str) -> None:
+    if not config.get("logging", {}).get("conversations", True):
         return
     try:
-        log_dir = _conv_log_dir()
+        log_dir = _home() / "logs" / "conversations"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{chat_id}.jsonl"
-
-        # Rotate before appending if the file is getting too large
-        if log_path.exists():
-            max_bytes = int(logging_cfg.get("max_bytes_per_user", _LOG_DEFAULT_MAX_BYTES))
-            _rotate_log_if_needed(log_path, max_bytes)
-
-        entry = {
-            "ts": datetime.utcnow().isoformat(),
-            "chat_id": chat_id,
-            "role": role,
-            "user": user_msg,
-            "agent": agent_reply,
-        }
+        if log_path.exists() and log_path.stat().st_size > _LOG_MAX_BYTES:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+            tmp = log_path.with_suffix(".tmp")
+            tmp.write_text("".join(lines[max(1, len(lines) // 5):]), encoding="utf-8")
+            tmp.replace(log_path)
+        entry = {"ts": datetime.utcnow().isoformat(), "chat_id": chat_id, "user": user_msg, "agent": reply}
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
-        print(f"[agentshield] Conversation log failed: {e}", flush=True)
+        print(f"[agentshield] Log error: {e}", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Admin command handler
-# ---------------------------------------------------------------------------
-
-_ADMIN_COMMANDS = {"as_assign", "as_revoke", "as_roles", "as_info"}
-
-
-def _handle_admin_command(
-    context: Dict[str, Any],
-    config: Dict[str, Any],
-    dynamic: Dict[str, str],
-) -> Optional[Dict[str, Any]]:
-    """
-    Process owner-only admin commands. Returns a block response with the result,
-    or None if the message is not an admin command.
-
-    Commands:
-      /as_assign <chat_id> <role>  — assign a role dynamically
-      /as_revoke <chat_id>         — remove dynamic assignment
-      /as_roles                    — list all dynamic assignments
-      /as_info <chat_id>           — show role + rate state for a user
-
-    Valid roles in the 2-role model: guest only.
-    (owner is reserved but not assignable via /as_assign — it is a config-level concept.)
-    """
-    if not context.get("is_command"):
-        return None
-
-    cmd = (context.get("command") or "").lower().strip()
-    if cmd not in _ADMIN_COMMANDS:
-        return None
-
-    # Parse args from the raw message
-    message = context.get("message", "")
-    parts = message.strip().split()
-    args = parts[1:]
-
-    # Valid assignable roles: only guest in the 2-role model.
-    # owner is intentionally excluded — it is set via config, not /as_assign.
-    valid_roles = set(config.get("roles", {}).keys())
-
-    if cmd == "as_assign":
-        if len(args) < 2:
-            reply = "Usage: /as_assign <chat_id> <role>\nValid roles: " + ", ".join(sorted(valid_roles))
-        else:
-            target_id, role_name = str(args[0]), args[1].lower()
-            if role_name not in valid_roles:
-                reply = f"Unknown role: {role_name}\nValid roles: {', '.join(sorted(valid_roles))}"
-            else:
-                dynamic[target_id] = role_name
-                _save_dynamic_roles(dynamic)
-                reply = f"✅ Assigned role '{role_name}' to chat_id {target_id}"
-
-    elif cmd == "as_revoke":
-        if len(args) < 1:
-            reply = "Usage: /as_revoke <chat_id>"
-        else:
-            target_id = str(args[0])
-            if target_id in dynamic:
-                removed_role = dynamic.pop(target_id)
-                _save_dynamic_roles(dynamic)
-                reply = f"✅ Revoked dynamic role '{removed_role}' from {target_id}"
-            else:
-                reply = f"No dynamic role found for {target_id}"
-
-    elif cmd == "as_roles":
-        if not dynamic:
-            reply = "No dynamic role assignments."
-        else:
-            lines = [f"Dynamic role assignments ({len(dynamic)}):"]
-            for cid, role in sorted(dynamic.items()):
-                lines.append(f"  {cid} → {role}")
-            reply = "\n".join(lines)
-
-    elif cmd == "as_info":
-        if len(args) < 1:
-            reply = "Usage: /as_info <chat_id>"
-        else:
-            target_id = str(args[0])
-            role = _find_role(target_id, config, dynamic) or "guest"
-            with _rate_lock:
-                rate_info = _rate_state.get(target_id, {})
-                min_count = rate_info.get("minute", {}).get("count", 0)
-                day_count = rate_info.get("day", {}).get("count", 0)
-            reply = (
-                f"chat_id: {target_id}\n"
-                f"role: {role}\n"
-                f"messages this minute: {min_count}\n"
-                f"messages today: {day_count}"
-            )
-    else:
-        return None
-
-    return {"allow": False, "reason": reply}
-
-
-# ---------------------------------------------------------------------------
-# Main handler — before_message
-# ---------------------------------------------------------------------------
+# ── Main handler ─────────────────────────────────────────────────────────────
 
 async def handle(event_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    AgentShield gateway hook handler.
-
-    before_message: enforce RBAC + rate limits, handle admin commands.
-    agent:end: log conversation turn.
-
-    Returns:
-        {"allow": True}                     — message proceeds to agent
-        {"allow": False, "reason": "..."}   — blocked, reason sent to user
-        {"allow": True, "enabled_toolsets": [...]}  — MRQ-31: toolsets for agent
-
-    This function NEVER raises. Any unexpected exception is caught, logged,
-    and treated as allow=True (fail-open) to prevent dropping customer messages.
-    """
+    """Hook entry point. Never raises — fail-open to avoid dropping customer messages."""
     try:
-        return await _handle_inner(event_type, context)
+        return await _inner(event_type, context)
     except Exception as e:
-        print(f"[agentshield] Unexpected error in handle({event_type}): {e}", flush=True)
+        print(f"[agentshield] Unexpected error ({event_type}): {e}", flush=True)
         return {"allow": True}
 
 
-async def _handle_inner(event_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
-    """Inner handler — may raise; wrapped by handle() for safety."""
-
-    # ── agent:end → log conversation ──────────────────────────────────────
-    if event_type == "agent:end":
-        config = _load_config()
-        if config and config.get("enabled", True):
-            chat_id = str(context.get("user_id") or context.get("chat_id") or "")
-            dynamic = _load_dynamic_roles()
-            role = _find_role(chat_id, config, dynamic) or "guest"
-            _log_conversation(
-                config,
-                chat_id,
-                role,
-                context.get("message", ""),
-                context.get("response", ""),
-            )
-        return {"allow": True}
-
-    # ── before_message ─────────────────────────────────────────────────────
+async def _inner(event_type: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
     config = _load_config()
 
-    # Disabled or no config → pass through
+    # agent:end — log conversation and exit
+    if event_type == "agent:end":
+        if config and config.get("enabled", True):
+            chat_id = str(ctx.get("user_id") or ctx.get("chat_id") or "")
+            _log(config, chat_id, ctx.get("message", ""), ctx.get("response", ""))
+        return {"allow": True}
+
+    # Disabled or missing config — pass through
     if not config or not config.get("enabled", True):
         return {"allow": True}
 
-    chat_id = str(context.get("chat_id") or context.get("user_id") or "")
+    chat_id = str(ctx.get("chat_id") or ctx.get("user_id") or "")
     if not chat_id:
         return {"allow": True}
 
-    dynamic = _load_dynamic_roles()
-    role = _find_role(chat_id, config, dynamic)
-    messages = config.get("messages", {})
+    msgs = config.get("messages", {})
 
-    # ── TODO: owner role ───────────────────────────────────────────────────
-    # When owner bypass is implemented:
-    #   if role == "owner":
-    #       admin_result = _handle_admin_command(context, config, dynamic)
-    #       if admin_result is not None:
-    #           return admin_result
-    #       _record_message(chat_id)
-    #       return {"allow": True}
-    #
-    # For now, owner_chat_id is not set in default config — the owner
-    # interacts via CLI on the server, not via Telegram.
-    # ──────────────────────────────────────────────────────────────────────
+    # Rate limit check (applied equally to all users)
+    rate_limits = config.get("rate_limit", {})
+    if rate_limits:
+        key = _check_rate(chat_id, rate_limits)
+        if key:
+            _notify_owner(config, key, chat_id, "rate limit hit")
+            return {"allow": False, "reason": msgs.get(key, "Rate limit exceeded. Please try again later.")}
 
-    # ── Unlisted user ──────────────────────────────────────────────────────
-    if role is None:
-        if config.get("deny_unlisted", False):
-            reason = messages.get("unlisted_denied", "You don't have access to this agent.")
-            return {"allow": False, "reason": reason}
-        # All unlisted users fall into guest — the only active role.
-        role = "guest"
+    # Action permission check
+    action = _infer_action(ctx)
+    if not _allowed(action, config):
+        _notify_owner(config, "action_denied", chat_id, f"action={action}")
+        return {"allow": False, "reason": msgs.get("action_denied", "That feature isn't available in this chat.")}
 
-    role_cfg = config.get("roles", {}).get(role, {})
-    message_text = context.get("message", "")
-
-    # ── MRQ-32: Prompt injection guard (before action check) ───────────────
-    injection_result = _check_prompt_injection(message_text, chat_id, config)
-    if injection_result is not None:
-        return injection_result
-
-    # ── MRQ-33: Human escalation (after injection guard, before rate limit) ─
-    escalation_result = _check_human_escalation(message_text, chat_id, config)
-    if escalation_result is not None:
-        return escalation_result
-
-    # ── Guest role — rate limit check ─────────────────────────────────────
-    rate_limits = role_cfg.get("rate_limit", {})
-
-    # MRQ-30: check if this role is unlimited in rate_limiting.roles
-    rl_cfg = config.get("rate_limiting", {})
-    role_override = rl_cfg.get("roles", {}).get(role)
-    if role_override == 0:
-        # 0 = unlimited — skip rate limit check
-        rate_limits = {}
-        skip_rate_limit = True
-    else:
-        skip_rate_limit = False
-
-    if not skip_rate_limit and (rate_limits or rl_cfg):
-        limit_key = _check_rate_limit(chat_id, rate_limits, config)
-        if limit_key:
-            reason = messages.get(limit_key, "Rate limit exceeded. Please try again later.")
-            alerts = config.get("alerts", {})
-            if alerts.get("on_rate_limit", False):
-                _notify_owner(config, limit_key, chat_id, f"role={role}")
-            return {"allow": False, "reason": reason}
-
-    # ── Action permission check ───────────────────────────────────────────
-    action = _infer_action(context)
-    if not _is_action_allowed(action, role_cfg):
-        reason = messages.get("action_denied", "You don't have permission for that.")
-        alerts = config.get("alerts", {})
-        if alerts.get("on_action_denied", True):
-            user_msg = context.get("message", "")[:80]
-            _notify_owner(config, "action_denied", chat_id,
-                          f"role={role} action={action} msg=\"{user_msg}\"")
-        return {"allow": False, "reason": reason}
-
-    # ── All checks passed ─────────────────────────────────────────────────
-    _record_message(chat_id)
-
-    # ── MRQ-31: Return toolsets if configured for this role ────────────────
-    toolsets = _get_role_toolsets(role, role_cfg)
-    if toolsets:
-        return {"allow": True, "enabled_toolsets": toolsets}
-
+    _record(chat_id)
     return {"allow": True}
